@@ -82,14 +82,14 @@ jobs:
             EOF
 
             # ensure static site exists (fix path if needed)
-            if [ ! -f full_duplex_assistant_v1/web/index.html ]; then
+            if [ ! -f ./web/index.html ]; then
               echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
               ls -la full_duplex_assistant_v1 || true
             fi
 
             # pull the exact tag & run
-            docker compose pull assistant
-            docker compose up -d --remove-orphans
+            docker-compose pull assistant
+            docker-compose up -d --remove-orphans
 
             # basic smoke test (HTTPS)
             for i in {1..30}; do
