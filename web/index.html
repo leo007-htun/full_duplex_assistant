@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Voice</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui;margin:2rem;max-width:800px}
+    button{padding:.6rem 1rem;margin-right:.5rem}
+    pre{background:#f6f6f6;padding:1rem;border-radius:.5rem;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <h1>Realtime Voice</h1>
+  <p>Click Start to grant mic access. Speak any time—TTS will stop instantly when you talk.</p>
+
+  <button id="start">🎙️ Start</button>
+  <button id="stop" disabled>⏹️ Stop</button>
+
+  <p><strong>Partial:</strong> <span id="partial"></span></p>
+  <pre id="final"></pre>
+
+  <script>
+  // Use your current origin automatically (avoids hardcoding domain)
+  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/stream';
+
+  let ws, audioCtx, processor, src, stream, running=false, ttsPlayer=null;
+
+  class PCMStreamer {
+    constructor(targetRate=24000){
+      this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+      this.deviceRate = this.ctx.sampleRate;      // ~48000
+      this.targetRate = targetRate;
+      this.q = [];
+      this.node = this.ctx.createScriptProcessor(2048,1,1); // smaller = lower latency
+      this.node.onaudioprocess = e => this._pull(e);
+      this.node.connect(this.ctx.destination);
+    }
+    stop(){ try{this.node.disconnect()}catch{}; try{this.ctx.close()}catch{}; this.q=[]; }
+    pushB64PCM16(b64){
+      const bin = atob(b64), buf = new ArrayBuffer(bin.length), u8 = new Uint8Array(buf);
+      for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+      this.pushPCM16(new Int16Array(buf));
+    }
+    pushPCM16(int16){
+      const f32 = new Float32Array(int16.length);
+      for(let i=0;i<int16.length;i++) f32[i] = int16[i]/0x8000;
+      this.q.push(resampleLinear(f32, this.targetRate, this.deviceRate));
+    }
+    _pull(e){
+      const out = e.outputBuffer.getChannelData(0);
+      let off=0;
+      while(off<out.length && this.q.length){
+        const frame=this.q[0], take=Math.min(out.length-off, frame.length);
+        out.set(frame.subarray(0,take), off);
+        off+=take;
+        if(take<frame.length) this.q[0]=frame.subarray(take); else this.q.shift();
+      }
+      if(off<out.length) out.fill(0,off);
+    }
+  }
+  function resampleLinear(f32,inR,outR){
+    if(inR===outR) return f32;
+    const ratio=outR/inR, out=new Float32Array(Math.floor(f32.length*ratio));
+    let pos=0;
+    for(let i=0;i<out.length;i++){
+      const idx=pos|0, frac=pos-idx, a=f32[idx]||0, b=f32[idx+1]||0;
+      out[i]=a+(b-a)*frac; pos+=1/ratio;
+    }
+    return out;
+  }
+  function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
+  function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
+  function downsample(buf,inRate,outRate=16000){
+    if(inRate===outRate) return buf;
+    const ratio=inRate/outRate, outLen=Math.floor(buf.length/ratio);
+    const out=new Float32Array(outLen); let pos=0;
+    for(let i=0;i<outLen;i++){ out[i]=buf[Math.floor(pos)]; pos+=ratio; }
+    return out;
+  }
+
+  async function start(){
+    if(running) return; running=true;
+
+    ws = new WebSocket(WS_URL);
+    ws.onmessage = (e)=>{
+      const m = JSON.parse(e.data);
+
+      if(m.type==="partial"){ document.getElementById("partial").textContent = m.text; }
+      if(m.type==="final"){
+        document.getElementById("partial").textContent = "";
+        document.getElementById("final").textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
+      }
+
+      // >>> TTS streaming <<<
+      if(m.type==="tts_start"){
+        if(ttsPlayer) ttsPlayer.stop();
+        ttsPlayer = new PCMStreamer(m.sample_rate||24000);
+        ttsPlayer.ctx.resume(); // ensure audio allowed after user click
+      }
+      if(m.type==="tts_chunk" && ttsPlayer){
+        ttsPlayer.pushB64PCM16(m.pcm_b64);
+      }
+      if(m.type==="tts_end"){
+        setTimeout(()=>{ if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }}, 300);
+      }
+      // >>> INSTANT STOP cues <<<
+      if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
+        if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
+      }
+    };
+
+    // mic → tiny frames → WS
+    stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
+    const srcNode = audioCtx.createMediaStreamSource(stream);
+    const proc = audioCtx.createScriptProcessor(1024,1,1); // ~21ms @48k
+    srcNode.connect(proc); proc.connect(audioCtx.destination);
+    processor = proc; src = srcNode;
+
+    processor.onaudioprocess = (e)=>{
+      if(!ws || ws.readyState!==WebSocket.OPEN) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const ds = downsample(input, audioCtx.sampleRate, 16000);
+      const i16 = f32ToI16(ds);
+      ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) }));
+    };
+
+    document.getElementById("start").disabled = true;
+    document.getElementById("stop").disabled = false;
+  }
+
+  function stop(){
+    running=false;
+    // also tell server to kill any TTS immediately
+    if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({ type:"barge_in" }));
+    try{ processor.disconnect(); }catch{}
+    try{ src.disconnect(); }catch{}
+    try{ stream.getTracks().forEach(t=>t.stop()); }catch{}
+    try{ audioCtx.close(); }catch{}
+    try{ ws.close(); }catch{}
+    if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
+    document.getElementById("start").disabled = false;
+    document.getElementById("stop").disabled = true;
+  }
+
+  document.getElementById("start").onclick = start;   // user gesture unlocks audio
+  document.getElementById("stop").onclick  = stop;
+  </script>
+</body>
+</html>

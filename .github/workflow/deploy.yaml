@@ -1,0 +1,98 @@
+name: Build, Push & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_push:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Short SHA
+        id: vars
+        run: echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./src/assistant/utils/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            sithuyehtun/full_duplex_assistant:latest
+            sithuyehtun/full_duplex_assistant:${{ steps.vars.outputs.sha_short }}
+
+  deploy:
+    needs: build_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            # prepare directory & repo
+            mkdir -p "${{ secrets.SERVER_PATH }}"
+            if [ ! -d "${{ secrets.SERVER_PATH }}/.git" ]; then
+              git clone https://github.com/${{ github.repository }} "${{ secrets.SERVER_PATH }}"
+            fi
+
+            cd "${{ secrets.SERVER_PATH }}"
+            git fetch --all --prune
+            git reset --hard origin/main
+
+            # write app env (server only, NOT committed)
+            mkdir -p src/assistant
+            cat > src/assistant/.env << 'EOF'
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            ALLOWED_ORIGINS=https://com-cloud.cloud
+            ENABLE_VOICE=0
+            EOF
+
+            # write root .env with ACME email + IMAGE_TAG to pin
+            cat > .env << 'EOF'
+            LE_EMAIL=${{ secrets.LE_EMAIL }}
+            IMAGE_TAG=${{ needs.build_push.outputs.tag }}
+            EOF
+
+            # ensure static site exists (fix path if needed)
+            if [ ! -f full_duplex_assistant_v1/web/index.html ]; then
+              echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
+              ls -la full_duplex_assistant_v1 || true
+            fi
+
+            # pull the exact tag & run
+            docker compose pull assistant
+            docker compose up -d --remove-orphans
+
+            # basic smoke test (HTTPS)
+            for i in {1..30}; do
+              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
+              sleep 5
+            done
+            echo "Deployed image tag: ${IMAGE_TAG}"

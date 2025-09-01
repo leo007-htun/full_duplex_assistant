@@ -1,37 +1,75 @@
+version: "3.9"
+
 services:
-
-  bpmn_assistant:
-    build:
-      context: .
-      dockerfile: ./src/bpmn_assistant/Dockerfile
+  traefik:
+    image: traefik:v3.0
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
     ports:
-        - "8000:8000"
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [web]
+    restart: unless-stopped
+
+  web:
+    image: nginx:alpine
+    volumes:
+      # ✅ fix this path if your folder is actually 'full_duplex_assistant_v1'
+      - ./web:/usr/share/nginx/html:ro
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`)
+      - traefik.http.routers.web.entrypoints=websecure
+      - traefik.http.routers.web.tls.certresolver=letsencrypt
+      - traefik.http.routers.web.priority=1
+      - traefik.http.services.web.loadbalancer.server.port=80
+    networks: [web]
+    restart: unless-stopped
+
+  assistant:
+    # 👇 CI will set IMAGE_TAG to the commit SHA; default to latest
+    image: sithuyehtun/full_duplex_assistant:${IMAGE_TAG:-latest}
     env_file:
-      - ./src/bpmn_assistant/.env
-    networks:
-      - bpmn-network
-
-  bpmn_layout_server:
-    build:
-      context: .
-      dockerfile: ./src/bpmn_layout_server/Dockerfile
-    ports:
-      - "3001:3001"
-    networks:
-      - bpmn-network
-
-  bpmn_frontend:
-    build:
-      context: .
-      dockerfile: ./src/bpmn_frontend/Dockerfile
-    ports:
-      - "8080:80"
-    depends_on:
-      - bpmn_assistant
-      - bpmn_layout_server
-    networks:
-        - bpmn-network
+      - ./src/assistant/.env
+    environment:
+      - ENABLE_VOICE=0
+      - ALLOWED_ORIGINS=https://com-cloud.cloud
+    expose:
+      - "8000"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ws.rule=Host(`com-cloud.cloud`) && PathPrefix(`/ws`)
+      - traefik.http.routers.ws.entrypoints=websecure
+      - traefik.http.routers.ws.tls.certresolver=letsencrypt
+      - traefik.http.routers.ws.priority=100
+      - traefik.http.services.ws.loadbalancer.server.port=8000
+      - traefik.http.routers.api.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls.certresolver=letsencrypt
+      - traefik.http.routers.api.priority=50
+      - traefik.http.services.api.loadbalancer.server.port=8000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [web]
+    restart: unless-stopped
 
 networks:
-  bpmn-network:
+  web:
     driver: bridge
+
+volumes:
+  traefik_letsencrypt:
