@@ -1,0 +1,3 @@
+[submodule "src/assistant/scraper"]
+	path = src/assistant/scraper
+	url = https://github.com/leo007-htun/full_duplex_assistant
