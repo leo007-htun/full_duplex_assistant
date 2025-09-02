@@ -87,11 +87,6 @@ jobs:
               ls -la full_duplex_assistant_v1 || true
             fi
 
-            echo ">>> Cleaning up old containers and images..."
-            docker stop $(docker ps -aq) || true
-            docker rm -f $(docker ps -aq) || true
-            docker rmi -f $(docker images -q) || true
-            docker system prune -af --volumes || true
 
             echo ">>> Pulling new images and deploying..."
             docker-compose pull assistant
