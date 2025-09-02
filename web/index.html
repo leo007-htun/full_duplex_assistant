@@ -35,57 +35,46 @@
    URLs & globals
 ========================= */
 const WS_PATH  = '/ws/stream';
-const ECHO_PATH= '/ws/echo';           // backend echo endpoint (add in FastAPI for quick routing test)
+const ECHO_PATH= '/ws/echo';
 const WS_URL   = (location.protocol==='https:'?'wss://':'ws://') + location.host + WS_PATH;
 const ECHO_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host + ECHO_PATH;
 
 let ws, wsRetry=0, pingTimer=null;
 let audioCtx=null, micNode=null, stream=null, running=false;
-let ttsPlayer=null;
+
+// ==== TTS (AudioWorklet) ====
+let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
 
 /* =========================
-   Tiny PCM streamer for TTS
+   Helpers
 ========================= */
-class PCMStreamer {
-  constructor(targetRate=24000){
-    this.ctx = new (window.AudioContext||window.webkitAudioContext)();
-    this.deviceRate = this.ctx.sampleRate;
-    this.targetRate = targetRate;
-    this.q = [];
-    this.node = this.ctx.createScriptProcessor(2048,1,1);
-    this.node.onaudioprocess = e => this._pull(e);
-    this.node.connect(this.ctx.destination);
+const $ = id => document.getElementById(id);
+function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
+
+// base64 PCM16LE -> Float32 [-1,1]
+function base64ToFloat32(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const view = new DataView(bytes.buffer);
+  const out = new Float32Array(bytes.byteLength / 2);
+  for (let i = 0, j = 0; i < bytes.byteLength; i += 2, j++) {
+    const s = view.getInt16(i, true); // little-endian
+    out[j] = s / 32768;
   }
-  stop(){ try{this.node.disconnect()}catch{}; try{this.ctx.close()}catch{}; this.q=[]; }
-  pushB64PCM16(b64){
-    const bin = atob(b64), buf = new ArrayBuffer(bin.length), u8 = new Uint8Array(buf);
-    for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
-    this.pushPCM16(new Int16Array(buf));
-  }
-  pushPCM16(int16){
-    const f32 = new Float32Array(int16.length);
-    for(let i=0;i<int16.length;i++) f32[i] = int16[i]/0x8000;
-    this.q.push(resampleLinear(f32, this.targetRate, this.deviceRate));
-  }
-  _pull(e){
-    const out = e.outputBuffer.getChannelData(0);
-    let off=0;
-    while(off<out.length && this.q.length){
-      const frame=this.q[0], take=Math.min(out.length-off, frame.length);
-      out.set(frame.subarray(0,take), off);
-      off+=take;
-      if(take<frame.length) this.q[0]=frame.subarray(take); else this.q.shift();
-    }
-    if(off<out.length) out.fill(0,off);
-  }
+  return out;
 }
-function resampleLinear(f32,inR,outR){
-  if(inR===outR) return f32;
-  const ratio=outR/inR, out=new Float32Array(Math.floor(f32.length*ratio));
-  let pos=0;
-  for(let i=0;i<out.length;i++){
-    const idx=pos|0, frac=pos-idx, a=f32[idx]||0, b=f32[idx+1]||0;
-    out[i]=a+(b-a)*frac; pos+=1/ratio;
+// simple linear resampler (srcRate -> dstRate)
+function resampleLinear(f32, srcRate, dstRate){
+  if (srcRate === dstRate) return f32;
+  const ratio = dstRate / srcRate;
+  const out = new Float32Array(Math.floor(f32.length * ratio));
+  let pos = 0;
+  for (let i = 0; i < out.length; i++) {
+    const idx = pos | 0, frac = pos - idx;
+    const a = f32[idx] || 0, b = f32[idx+1] || a;
+    out[i] = a + (b - a) * frac;
+    pos += 1 / ratio;
   }
   return out;
 }
@@ -100,10 +89,24 @@ function downsample(buf,inRate,outRate=16000){
 }
 
 /* =========================
-   DOM helpers
+   TTS via AudioWorkletNode
 ========================= */
-const $ = id => document.getElementById(id);
-function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
+async function ensureTTSContext(sampleRateHint=24000){
+  if (ttsCtx && ttsNode) return;
+  // Try to hint device to 24k; many devices will still choose 44.1/48k.
+  ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
+  await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // <-- your file
+  ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
+  ttsNode.connect(ttsCtx.destination);
+}
+function ttsFlush(){
+  try { ttsNode?.port.postMessage({ type: 'flush' }); } catch {}
+}
+function ttsStop(){
+  try { ttsNode?.disconnect(); } catch {}
+  try { ttsCtx?.close(); } catch {}
+  ttsNode=null; ttsCtx=null;
+}
 
 /* =========================
    WebSocket lifecycle
@@ -125,30 +128,39 @@ function attachWS(socket){
     console.warn("[WS] close", e.code, e.reason);
     setStatus(`WebSocket closed (${e.code})`,"error");
     if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
-    // auto-reconnect if we were running
     if (running) {
       const backoff = Math.min(1000 * Math.pow(2, wsRetry++), 10000);
       setTimeout(() => { connectWS(); }, backoff);
     }
   };
-  socket.onmessage = (evt)=>{
+  socket.onmessage = async (evt)=>{
     const m = JSON.parse(evt.data);
+
     if(m.type==="partial"){ $('partial').textContent = m.text; }
     if(m.type==="final"){
       $('partial').textContent = "";
       $('final').textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
     }
-    // TTS
+
+    // ====== TTS handling (no ScriptProcessorNode) ======
     if(m.type==="tts_start"){
-      if(ttsPlayer) ttsPlayer.stop();
-      ttsPlayer = new PCMStreamer(m.sample_rate||24000);
-      ttsPlayer.ctx.resume();
+      ttsSrcRate = m.sample_rate || 24000;
+      await ensureTTSContext(ttsSrcRate);
+      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch {} }
       setStatus("Speaking…","speak");
     }
-    if(m.type==="tts_chunk" && ttsPlayer){ ttsPlayer.pushB64PCM16(m.pcm_b64); }
-    if(m.type==="tts_end"){ if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; } setStatus("Listening…","listen"); }
+    if(m.type==="tts_chunk" && ttsNode){
+      // decode PCM16 b64 -> float32 @ source rate, resample to output ctx rate, then post to worklet
+      const f32src = base64ToFloat32(m.pcm_b64);
+      const f32out = resampleLinear(f32src, ttsSrcRate, ttsCtx.sampleRate);
+      ttsNode.port.postMessage({ type: 'audio', samples: f32out }, [f32out.buffer]);
+    }
+    if(m.type==="tts_end"){
+      ttsFlush();
+      setStatus("Listening…","listen");
+    }
     if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
-      if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
+      ttsFlush();
       setStatus("Listening…","listen");
     }
   };
@@ -160,6 +172,7 @@ function connectWS(){
 
 /* =========================
    Mic → frames → WS
+   (Still ScriptProcessor; can upgrade to Worklet later)
 ========================= */
 async function start(){
   if(running) return; running=true;
@@ -191,7 +204,7 @@ async function start(){
 
   const srcNode = audioCtx.createMediaStreamSource(stream);
 
-  // Use ScriptProcessorNode (simple + supported everywhere). Upgrade later to AudioWorklet if you like.
+  // NOTE: still using ScriptProcessor here; we can swap to an AudioWorklet later if you want.
   const proc = audioCtx.createScriptProcessor(1024,1,1);
   proc.onaudioprocess = (e)=>{
     if(!ws || ws.readyState!==WebSocket.OPEN) return;
@@ -217,7 +230,7 @@ function stop(){
   try{ audioCtx && audioCtx.close(); }catch{}
   try{ ws && ws.close(); }catch{}
   if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
-  if (ttsPlayer) { ttsPlayer.stop(); ttsPlayer=null; }
+  ttsStop();
   $('start').disabled = false; $('stop').disabled = true;
   setStatus("Stopped.");
 }
@@ -237,7 +250,6 @@ $('echo').onclick = ()=>{
 $('start').onclick = start;
 $('stop').onclick  = stop;
 window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch{} });
-
 </script>
 </body>
 </html>
