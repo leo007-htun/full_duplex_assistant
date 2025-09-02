@@ -52,26 +52,30 @@
             docker-compose pull
             docker-compose up -d --remove-orphans
 
-            echo ">>> Waiting for Traefik to bind on 443..."
+            echo ">>> Wait for Traefik to bind on 443..."
             for i in {1..60}; do
               if docker exec full_duplex_traefik_1 sh -lc 'ss -tlpn | grep -q ":443 "'; then
+                echo "Traefik is listening on 443"
                 break
               fi
               sleep 2
             done
-
+            
             echo ">>> Local HTTPS test via loopback + Host header..."
             for i in {1..60}; do
               if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
+                echo "Local HTTPS check passed"
                 break
               fi
               sleep 2
             done
-
+            
             echo ">>> Public HTTPS smoke test..."
             for i in {1..60}; do
-              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
+              if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
+                echo "Public HTTPS check passed"
+                break
+              fi
               sleep 5
             done
 
-            echo "Deployed image tag: ${IMAGE_TAG}"
