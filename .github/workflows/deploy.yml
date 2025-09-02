@@ -57,17 +57,19 @@ jobs:
           script: |
             set -euo pipefail
 
-            # prepare directory & repo
-            mkdir -p "${{ secrets.SERVER_PATH }}"
-            if [ ! -d "${{ secrets.SERVER_PATH }}/.git" ]; then
-              git clone https://github.com/${{ github.repository }} "${{ secrets.SERVER_PATH }}"
+            REPO_PATH="${{ secrets.SERVER_PATH }}"
+
+            echo ">>> Prepare directory & repo"
+            mkdir -p "${REPO_PATH}"
+            if [ ! -d "${REPO_PATH}/.git" ]; then
+              git clone https://github.com/${{ github.repository }} "${REPO_PATH}"
             fi
 
-            cd "${{ secrets.SERVER_PATH }}"
+            cd "${REPO_PATH}"
             git fetch --all --prune
             git reset --hard origin/main
 
-            # write app env (server only, NOT committed)
+            echo ">>> Write app env"
             mkdir -p src/assistant
             cat > src/assistant/.env << 'EOF'
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
@@ -75,31 +77,51 @@ jobs:
             ENABLE_VOICE=0
             EOF
 
-            # write root .env with ACME email + IMAGE_TAG to pin
+            echo ">>> Write root .env"
             cat > .env << 'EOF'
             LE_EMAIL=${{ secrets.LE_EMAIL }}
             IMAGE_TAG=${{ needs.build_push.outputs.tag }}
             EOF
 
-            # ensure static site exists (fix path if needed)
             if [ ! -f ./web/index.html ]; then
-              echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
-              ls -la full_duplex_assistant_v1 || true
+              echo "WARNING: web/index.html missing. Check compose volume path."
+              ls -la web || true
             fi
 
-            echo ">>> Cleaning up old containers and images..."
+            echo ">>> Clean old containers/images (keep volumes for certs)"
             docker stop $(docker ps -aq) || true
             docker rm -f $(docker ps -aq) || true
-            docker rmi -f $(docker images -q) || true
+            docker image prune -af || true
 
-
-            echo ">>> Pulling new images and deploying..."
-            docker-compose pull assistant
+            echo ">>> Pull new images and start services"
+            docker-compose pull
             docker-compose up -d --remove-orphans
 
-            # basic smoke test (HTTPS)
-            for i in {1..30}; do
-              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
+            echo ">>> Wait for Traefik to bind 443"
+            for i in {1..60}; do
+              if docker exec full_duplex_traefik_1 sh -lc 'ss -tlpn | grep -q ":443 "'; then
+                echo "Traefik is listening on 443"
+                break
+              fi
+              sleep 2
+            done
+
+            echo ">>> Local HTTPS check (loopback with Host header)"
+            for i in {1..60}; do
+              if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
+                echo "Local HTTPS check passed"
+                break
+              fi
+              sleep 2
+            done
+
+            echo ">>> Public HTTPS smoke test"
+            for i in {1..60}; do
+              if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
+                echo "Public HTTPS check passed"
+                break
+              fi
               sleep 5
             done
+
             echo "Deployed image tag: ${IMAGE_TAG}"
