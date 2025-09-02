@@ -51,7 +51,7 @@ services:
       - "traefik.http.routers.web.priority=1"
       - "traefik.http.services.web.loadbalancer.server.port=80"
       - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
-      - "traefik.http.routers.api.middlewares=api-strip@docker
+      - "traefik.http.routers.api.middlewares=api-strip@docker"
     networks: [web]
     restart: unless-stopped
 
