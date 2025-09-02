@@ -40,7 +40,8 @@ const WS_URL   = (location.protocol==='https:'?'wss://':'ws://') + location.host
 const ECHO_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host + ECHO_PATH;
 
 let ws, wsRetry=0, pingTimer=null;
-let audioCtx=null, micNode=null, stream=null, running=false;
+let audioCtx=null, stream=null, running=false;
+let micNode=null, micSink=null;
 
 // ==== TTS (AudioWorklet) ====
 let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
@@ -59,12 +60,11 @@ function base64ToFloat32(b64) {
   const view = new DataView(bytes.buffer);
   const out = new Float32Array(bytes.byteLength / 2);
   for (let i = 0, j = 0; i < bytes.byteLength; i += 2, j++) {
-    const s = view.getInt16(i, true); // little-endian
+    const s = view.getInt16(i, true);
     out[j] = s / 32768;
   }
   return out;
 }
-// simple linear resampler (srcRate -> dstRate)
 function resampleLinear(f32, srcRate, dstRate){
   if (srcRate === dstRate) return f32;
   const ratio = dstRate / srcRate;
@@ -80,33 +80,19 @@ function resampleLinear(f32, srcRate, dstRate){
 }
 function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
-function downsample(buf,inRate,outRate=16000){
-  if(inRate===outRate) return buf;
-  const ratio=inRate/outRate, outLen=Math.floor(buf.length/ratio);
-  const out=new Float32Array(outLen); let pos=0;
-  for(let i=0;i<outLen;i++){ out[i]=buf[Math.floor(pos)]; pos+=ratio; }
-  return out;
-}
 
 /* =========================
    TTS via AudioWorkletNode
 ========================= */
 async function ensureTTSContext(sampleRateHint=24000){
   if (ttsCtx && ttsNode) return;
-  // Try to hint device to 24k; many devices will still choose 44.1/48k.
   ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
-  await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // <-- your file
+  await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // your TTS worklet
   ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
   ttsNode.connect(ttsCtx.destination);
 }
-function ttsFlush(){
-  try { ttsNode?.port.postMessage({ type: 'flush' }); } catch {}
-}
-function ttsStop(){
-  try { ttsNode?.disconnect(); } catch {}
-  try { ttsCtx?.close(); } catch {}
-  ttsNode=null; ttsCtx=null;
-}
+function ttsFlush(){ try { ttsNode?.port.postMessage({ type: 'flush' }); } catch {} }
+function ttsStop(){ try { ttsNode?.disconnect(); } catch {}; try { ttsCtx?.close(); } catch {}; ttsNode=null; ttsCtx=null; }
 
 /* =========================
    WebSocket lifecycle
@@ -116,7 +102,6 @@ function attachWS(socket){
   socket.onopen = ()=>{
     setStatus("WebSocket connected ✔","ok");
     wsRetry=0;
-    // keepalive (some proxies idle-drop)
     pingTimer = setInterval(()=>{ 
       if(socket.readyState===WebSocket.OPEN) {
         try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch {}
@@ -142,7 +127,7 @@ function attachWS(socket){
       $('final').textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
     }
 
-    // ====== TTS handling (no ScriptProcessorNode) ======
+    // ====== TTS handling ======
     if(m.type==="tts_start"){
       ttsSrcRate = m.sample_rate || 24000;
       await ensureTTSContext(ttsSrcRate);
@@ -150,29 +135,20 @@ function attachWS(socket){
       setStatus("Speaking…","speak");
     }
     if(m.type==="tts_chunk" && ttsNode){
-      // decode PCM16 b64 -> float32 @ source rate, resample to output ctx rate, then post to worklet
       const f32src = base64ToFloat32(m.pcm_b64);
       const f32out = resampleLinear(f32src, ttsSrcRate, ttsCtx.sampleRate);
       ttsNode.port.postMessage({ type: 'audio', samples: f32out }, [f32out.buffer]);
     }
-    if(m.type==="tts_end"){
-      ttsFlush();
-      setStatus("Listening…","listen");
-    }
+    if(m.type==="tts_end"){ ttsFlush(); setStatus("Listening…","listen"); }
     if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
-      ttsFlush();
-      setStatus("Listening…","listen");
+      ttsFlush(); setStatus("Listening…","listen");
     }
   };
 }
-function connectWS(){
-  ws = new WebSocket(WS_URL);
-  attachWS(ws);
-}
+function connectWS(){ ws = new WebSocket(WS_URL); attachWS(ws); }
 
 /* =========================
-   Mic → frames → WS
-   (Still ScriptProcessor; can upgrade to Worklet later)
+   Mic → AudioWorklet → WS  (no ScriptProcessor)
 ========================= */
 async function start(){
   if(running) return; running=true;
@@ -194,29 +170,38 @@ async function start(){
     setStatus("WS failed to open","error"); running=false; return;
   }
 
-  // 2) Get mic
+  // 2) Mic permission
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
 
-  // 3) AudioContext and capture
+  // 3) AudioContext and mic capture via Worklet
   audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
   if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); }catch{} }
 
-  const srcNode = audioCtx.createMediaStreamSource(stream);
+  await audioCtx.audioWorklet.addModule('/mic-capture-processor.js'); // your mic worklet
 
-  // NOTE: still using ScriptProcessor here; we can swap to an AudioWorklet later if you want.
-  const proc = audioCtx.createScriptProcessor(1024,1,1);
-  proc.onaudioprocess = (e)=>{
-    if(!ws || ws.readyState!==WebSocket.OPEN) return;
-    const input = e.inputBuffer.getChannelData(0);
-    const ds = downsample(input, audioCtx.sampleRate, 16000);
-    const i16 = f32ToI16(ds);
-    try {
-      ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) }));
-    } catch {}
+  const srcNode = audioCtx.createMediaStreamSource(stream);
+  const micNodeLocal = new AudioWorkletNode(audioCtx, 'mic-capture', {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: { downsampleTo: 16000, postIntervalMs: 100 }
+  });
+
+  // send captured (downsampled) audio to the server
+  micNodeLocal.port.onmessage = (e)=>{
+    const { type, samples } = e.data || {};
+    if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
+      const i16 = f32ToI16(samples);
+      try { ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) })); } catch {}
+    }
   };
-  srcNode.connect(proc); proc.connect(audioCtx.destination);
-  micNode = proc;
+
+  // keep node in the graph but muted
+  micSink = audioCtx.createGain(); micSink.gain.value = 0;
+  srcNode.connect(micNodeLocal); micNodeLocal.connect(micSink); micSink.connect(audioCtx.destination);
+
+  micNode = micNodeLocal;
 
   $('start').disabled = true; $('stop').disabled = false;
   setStatus("Listening…","listen");
@@ -226,11 +211,13 @@ function stop(){
   running=false;
   try{ ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"barge_in"})); }catch{}
   try{ micNode && micNode.disconnect(); }catch{}
+  try{ micSink && micSink.disconnect(); }catch{}
   try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
   try{ audioCtx && audioCtx.close(); }catch{}
   try{ ws && ws.close(); }catch{}
   if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
   ttsStop();
+  micNode=null; micSink=null; stream=null; audioCtx=null;
   $('start').disabled = false; $('stop').disabled = true;
   setStatus("Stopped.");
 }
