@@ -5,7 +5,7 @@ import base64
 import time
 import pyaudio
 import websockets
-import numpy as np  # optional, but kept for parity with your env
+import numpy as np  # optional
 import sounddevice as sd  # optional
 from playwright.async_api import async_playwright
 
@@ -22,7 +22,7 @@ from .voice.tts_player import StreamingTTSPlayer
 # =========================================================
 # ✅ Server config (env-driven)
 # =========================================================
-ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"   # server mic/tts off by default
+ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
 RATE = 16000
 CHUNK = 1024
@@ -75,6 +75,7 @@ def render_summarization_prompt(search_context: str) -> str:
 async def speak_tts(text: str):
     if not ENABLE_VOICE:
         return
+    # ensure previous playback halts before starting new
     tts_player.stop()
     async with client.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
@@ -198,7 +199,6 @@ async def determine_intent(msg: ChatMessage):
     else:
         result = "Hmm, I’m not sure what you mean."
 
-    # Server TTS (only if ENABLE_VOICE=1). Browser audio is streamed via WS separately.
     await speak_tts(result)
     return {"intent": intent, "reason": reason, "result": result}
 
@@ -262,7 +262,9 @@ class TTSSession:
         self.cancel_event = asyncio.Event()
 
     def cancel(self):
+        # signal streamers to stop and halt server audio immediately
         self.cancel_event.set()
+        tts_player.stop()
         if self.task and not self.task.done():
             self.task.cancel()
 
@@ -292,6 +294,8 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                         break
                     b64 = base64.b64encode(chunk).decode("utf-8")
                     await ws.send_text(json.dumps({"type": "tts_chunk", "pcm_b64": b64}))
+        except asyncio.CancelledError:
+            pass
         finally:
             await ws.send_text(json.dumps({"type": "tts_end"}))
 
@@ -299,6 +303,7 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
         if not ENABLE_VOICE:
             return
         try:
+            # ensure previous playback halted
             tts_player.stop()
             async with client.audio.speech.with_streaming_response.create(
                 model="gpt-4o-mini-tts",
@@ -306,11 +311,23 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 input=text,
                 response_format="pcm",
             ) as resp:
-                await tts_player.play_pcm_stream(resp)
+                # poll cancel flag between buffer writes
+                await tts_player.play_pcm_stream(resp, cancel_event=tts.cancel_event if hasattr(tts_player, "play_pcm_stream") else None)  # if your player supports it
+        except asyncio.CancelledError:
+            pass
         except Exception:
+            # swallow server-audio errors to not break browser stream
             pass
 
-    await asyncio.gather(to_browser(), to_server_speakers())
+    # Run both, but cancel the sibling if one completes or is cancelled
+    tasks = [asyncio.create_task(to_browser()), asyncio.create_task(to_server_speakers())]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -319,11 +336,11 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
     await ws.accept()
-    tts = TTSSession()  # one controller per connection
+    tts = TTSSession()
 
     uri = "wss://api.openai.com/v1/realtime?intent=transcription"
     headers = [
-        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY', '')}"),
+        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY', '')}")),
         ("OpenAI-Beta", "realtime=v1"),
     ]
 
@@ -337,9 +354,9 @@ async def ws_stream(ws: WebSocket):
                     "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.45,          # a bit more sensitive than 0.5
-                        "prefix_padding_ms": 150,    # keep some leading context
-                        "silence_duration_ms": 250   # quick end-of-turn
+                        "threshold": 0.45,
+                        "prefix_padding_ms": 150,
+                        "silence_duration_ms": 250
                     },
                     "input_audio_noise_reduction": {"type": "near_field"},
                 },
@@ -363,16 +380,14 @@ async def ws_stream(ws: WebSocket):
                         # Manual barge-in from client UI
                         if data.get("type") == "barge_in":
                             tts.cancel()
-                            tts_player.stop()
                             await ws.send_text(json.dumps({"type": "tts_stop"}))
                             continue
 
                         if data.get("type") == "audio":
                             await upstream.send(json.dumps({
                                 "type": "input_audio_buffer.append",
-                                "audio": data["audio_b64"],  # base64 PCM16 @ 16k mono
+                                "audio": data["audio_b64"],
                             }))
-                            # Low-latency: commit every frame so VAD fires ASAP
                             await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
 
                         elif data.get("type") == "flush":
@@ -387,9 +402,8 @@ async def ws_stream(ws: WebSocket):
                     t = evt.get("type")
 
                     if t == "input_audio_buffer.speech_started":
-                        # >>> INSTANT BARGE-IN <<<
+                        # Auto barge-in when user starts speaking
                         tts.cancel()
-                        tts_player.stop()
                         await ws.send_text(json.dumps({"type": "tts_stop"}))
                         await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
 
@@ -399,14 +413,14 @@ async def ws_stream(ws: WebSocket):
                     elif t == "conversation.item.input_audio_transcription.completed":
                         user_text = evt.get("transcript", "")
 
-                        # Route intent with your existing logic
+                        # Route intent
                         res = await determine_intent(ChatMessage(message=user_text))
                         reply = res.get("result", "")
 
                         # Send text immediately
                         await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
 
-                        # Start NEW streaming TTS (any previous is canceled already)
+                        # Start NEW streaming TTS (cancel previous)
                         tts.cancel()
                         tts.reset()
                         tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
@@ -419,6 +433,9 @@ async def ws_stream(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+    finally:
+        # ensure any TTS is stopped on disconnect
+        tts.cancel()
 
 
 # =========================================================
@@ -446,5 +463,4 @@ async def startup_event():
 # =========================================================
 if __name__ == "__main__":
     import uvicorn
-    # matches your Docker CMD: uvicorn assistant.app:app --app-dir src ...
     uvicorn.run("assistant.app:app", host="0.0.0.0", port=8000, reload=True)
