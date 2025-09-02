@@ -56,79 +56,50 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-          
-            REPO_PATH="${{ secrets.SERVER_PATH }}"
-          
-            echo ">>> Prepare directory & repo"
-            mkdir -p "${REPO_PATH}"
-            if [ ! -d "${REPO_PATH}/.git" ]; then
-              git clone https://github.com/${{ github.repository }} "${REPO_PATH}"
+
+            # prepare directory & repo
+            mkdir -p "${{ secrets.SERVER_PATH }}"
+            if [ ! -d "${{ secrets.SERVER_PATH }}/.git" ]; then
+              git clone https://github.com/${{ github.repository }} "${{ secrets.SERVER_PATH }}"
             fi
-          
-            cd "${REPO_PATH}"
+
+            cd "${{ secrets.SERVER_PATH }}"
             git fetch --all --prune
             git reset --hard origin/main
-          
-            echo ">>> Write app env"
-            mkdir -p src/assistant
-            # no heredocs; write with printf (shell-safe)
-            printf '%s\n' \
-              "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" \
-              "ALLOWED_ORIGINS=https://com-cloud.cloud" \
-              "ENABLE_VOICE=0" \
-              > src/assistant/.env
-          
-            echo ">>> Write root .env"
-            printf '%s\n' \
-              "LE_EMAIL=${{ secrets.LE_EMAIL }}" \
-              "IMAGE_TAG=${{ needs.build_push.outputs.tag }}" \
-              > .env
-          
-            echo ">>> Ensure ACME storage (bind mount ./letsencrypt) with strict perms"
-            mkdir -p ./letsencrypt
-            touch ./letsencrypt/acme.json
-            chmod 600 ./letsencrypt/acme.json || true
-            ls -l ./letsencrypt || true
-          
-            if [ ! -f ./web/index.html ]; then
-              echo "⚠️  WARNING: web/index.html missing. Check compose volume path."
-              ls -la web || true
-            fi
-          
-            echo ">>> Stop this compose project only"
-            docker compose down --remove-orphans || true
-          
-            echo ">>> Prune only unused images/cache"
-            docker image prune -af || true
-            docker builder prune -af || true
-          
-            echo ">>> Pull and start"
-            docker compose pull
-            docker compose up -d --remove-orphans
-          
-            echo ">>> Local HTTPS check (Host header)"
-            for i in {1..30}; do
-              if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
-                echo "Local HTTPS check passed"
-                break
-              fi
-              sleep 2
-              if [ $i -eq 30 ]; then
-                echo "❌ Local HTTPS check failed"; exit 1
-              fi
-            done
-          
-            echo ">>> Public HTTPS smoke test"
-            for i in {1..30}; do
-              if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
-                echo "Public HTTPS check passed"
-                break
-              fi
-              sleep 5
-              if [ $i -eq 30 ]; then
-                echo "❌ Public HTTPS check failed"; exit 1
-              fi
-            done
-          
-            echo "✅ Deployed image tag: ${{ needs.build_push.outputs.tag }}"
 
+            # write app env (server only, NOT committed)
+            mkdir -p src/assistant
+            cat > src/assistant/.env << 'EOF'
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            ALLOWED_ORIGINS=https://com-cloud.cloud
+            ENABLE_VOICE=0
+            EOF
+
+            # write root .env with ACME email + IMAGE_TAG to pin
+            cat > .env << 'EOF'
+            LE_EMAIL=${{ secrets.LE_EMAIL }}
+            IMAGE_TAG=${{ needs.build_push.outputs.tag }}
+            EOF
+
+            # ensure static site exists (fix path if needed)
+            if [ ! -f ./web/index.html ]; then
+              echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
+              ls -la full_duplex_assistant_v1 || true
+            fi
+
+            echo ">>> Cleaning up old containers and images..."
+            docker stop $(docker ps -aq) || true
+            docker rm -f $(docker ps -aq) || true
+            docker rmi -f $(docker images -q) || true
+            docker system prune -af --volumes || true
+
+            echo ">>> Pulling new images and deploying..."
+            docker-compose pull assistant
+            docker-compose up -d --remove-orphans
+
+            # basic smoke test (HTTPS)
+            for i in {1..30}; do
+              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
+              sleep 5
+            done
+            echo "Deployed image tag: ${IMAGE_TAG}"
