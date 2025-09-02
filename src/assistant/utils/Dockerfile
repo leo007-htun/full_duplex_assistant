@@ -1,104 +1,39 @@
-name: Build, Push & Deploy
+FROM python:3.8-slim
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch: {}
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ENABLE_VOICE=0 \
+    PYTHONPATH=/app/src
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc python3-dev \
+    curl ca-certificates \
+    libasound2 libasound2-dev portaudio19-dev \
+    ffmpeg \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+    libpangocairo-1.0-0 libgtk-3-0 \
+  && rm -rf /var/lib/apt/lists/*
 
-jobs:
-  build_push:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.vars.outputs.sha_short }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+WORKDIR /app
 
-      - name: Short SHA
-        id: vars
-        run: echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+RUN pip install --no-cache-dir \
+    fastapi==0.110.0 \
+    "uvicorn[standard]==0.23.2" \
+    pydantic==2.6.4 \
+    jinja2==3.1.3 \
+    websockets==10.4 \
+    numpy==1.24.4 \
+    sounddevice==0.4.6 \
+    pyaudio==0.2.13 \
+    playwright==1.40.0 \
+    openai==1.97.0 \
+    "httpx<0.28"
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+RUN python -m playwright install --with-deps
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+COPY . .
 
-      - name: Build & Push (amd64)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./src/assistant/utils/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            sithuyehtun/full_duplex_assistant:latest
-            sithuyehtun/full_duplex_assistant:${{ steps.vars.outputs.sha_short }}
+EXPOSE 8000
 
-  deploy:
-    needs: build_push
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-
-            # prepare directory & repo
-            mkdir -p "${{ secrets.SERVER_PATH }}"
-            if [ ! -d "${{ secrets.SERVER_PATH }}/.git" ]; then
-              git clone https://github.com/${{ github.repository }} "${{ secrets.SERVER_PATH }}"
-            fi
-
-            cd "${{ secrets.SERVER_PATH }}"
-            git fetch --all --prune
-            git reset --hard origin/main
-
-            # write app env (server only, NOT committed)
-            mkdir -p src/assistant
-            cat > src/assistant/.env << 'EOF'
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            ALLOWED_ORIGINS=https://com-cloud.cloud
-            ENABLE_VOICE=0
-            EOF
-
-            # write root .env with ACME email + IMAGE_TAG to pin
-            cat > .env << 'EOF'
-            LE_EMAIL=${{ secrets.LE_EMAIL }}
-            IMAGE_TAG=${{ needs.build_push.outputs.tag }}
-            EOF
-
-            # ensure static site exists (fix path if needed)
-            if [ ! -f ./web/index.html ]; then
-              echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
-              ls -la full_duplex_assistant_v1 || true
-            fi
-
-            echo ">>> Cleaning up old containers and images..."
-            docker stop $(docker ps -aq) || true
-            docker rm -f $(docker ps -aq) || true
-            docker rmi -f $(docker images -q) || true
-
-            echo ">>> Pulling new images and deploying..."
-            docker-compose pull assistant
-            docker-compose up -d --remove-orphans
-
-            # basic smoke test (HTTPS)
-            for i in {1..30}; do
-              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
-              sleep 5
-            done
-            echo "Deployed image tag: ${IMAGE_TAG}"
+CMD ["uvicorn", "assistant.app:app", "--host", "0.0.0.0", "--port", "8000"]
