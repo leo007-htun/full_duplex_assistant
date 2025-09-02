@@ -56,65 +56,84 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-          
+
+            # pick compose v2 if present, else docker-compose (v1)
+            if docker compose version >/dev/null 2>&1; then
+              compose() { docker compose "$@"; }
+            else
+              compose() { docker-compose "$@"; }
+            fi
+
             REPO_PATH="${{ secrets.SERVER_PATH }}"
-          
+
             echo ">>> Prepare directory & repo"
             mkdir -p "${REPO_PATH}"
             if [ ! -d "${REPO_PATH}/.git" ]; then
               git clone https://github.com/${{ github.repository }} "${REPO_PATH}"
             fi
-          
+
             cd "${REPO_PATH}"
             git fetch --all --prune
             git reset --hard origin/main
-          
+
+            echo ">>> Detect compose file"
+            COMPOSE_FILE=""
+            for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+              if [ -f "$f" ]; then COMPOSE_FILE="$f"; break; fi
+            done
+            if [ -z "$COMPOSE_FILE" ]; then
+              echo "❌ No compose file found in $(pwd)."; ls -la; exit 1
+            fi
+            echo "Using compose file: $COMPOSE_FILE"
+
             echo ">>> Write app env"
             mkdir -p src/assistant
             printf 'OPENAI_API_KEY=%s\nALLOWED_ORIGINS=%s\nENABLE_VOICE=0\n' \
               "${{ secrets.OPENAI_API_KEY }}" "https://com-cloud.cloud" \
               > src/assistant/.env
-          
+
             echo ">>> Write root .env"
             printf 'LE_EMAIL=%s\nIMAGE_TAG=%s\n' \
               "${{ secrets.LE_EMAIL }}" "${{ needs.build_push.outputs.tag }}" \
               > .env
-          
-            echo ">>> Ensure ACME storage with strict perms"
+
+            # If your compose mounts ./letsencrypt to /letsencrypt for Traefik:
+            echo ">>> Ensure ACME storage (bind mount) with strict perms"
             mkdir -p ./letsencrypt
             [ -f ./letsencrypt/acme.json ] || : > ./letsencrypt/acme.json
             chmod 600 ./letsencrypt/acme.json || true
             ls -l ./letsencrypt || true
-          
+
+            echo ">>> Validate compose"
+            compose -f "$COMPOSE_FILE" config >/dev/null
+
             echo ">>> Stop this compose project only"
-            docker compose down --remove-orphans || true
-          
+            compose -f "$COMPOSE_FILE" down --remove-orphans || true
+
             echo ">>> Prune only unused images/cache"
             docker image prune -af || true
             docker builder prune -af || true
-          
+
             echo ">>> Pull and start"
-            docker compose pull
-            docker compose up -d --remove-orphans
-          
-            echo ">>> Local HTTPS check"
+            compose -f "$COMPOSE_FILE" pull
+            compose -f "$COMPOSE_FILE" up -d --remove-orphans
+
+            echo ">>> Local HTTPS check (Host header)"
             for i in {1..30}; do
               if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
-                echo "Local HTTPS check passed"
-                break
+                echo "Local HTTPS check passed"; break
               fi
               sleep 2
               if [ $i -eq 30 ]; then echo "❌ Local HTTPS check failed"; exit 1; fi
             done
-          
-            echo ">>> Public HTTPS check"
+
+            echo ">>> Public HTTPS smoke test"
             for i in {1..30}; do
               if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
-                echo "Public HTTPS check passed"
-                break
+                echo "Public HTTPS check passed"; break
               fi
               sleep 5
               if [ $i -eq 30 ]; then echo "❌ Public HTTPS check failed"; exit 1; fi
             done
-          
+
             echo "✅ Deployed image tag: ${{ needs.build_push.outputs.tag }}"
