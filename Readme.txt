@@ -19,3 +19,7 @@ git push origin main
 
 docker compose logs -f traefik
 docker compose logs -f assistant
+
+
+
+WARNING!!! deployment prunes all PS and images running, then pull them back
