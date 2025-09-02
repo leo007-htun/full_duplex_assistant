@@ -1,8 +1,19 @@
 version: "3.9"
 
 services:
+  # One-shot init to ensure ./letsencrypt/acme.json exists with 0600
+  init_letsencrypt:
+    image: alpine:3.20
+    command: sh -c "mkdir -p /letsencrypt && touch /letsencrypt/acme.json && chmod 600 /letsencrypt/acme.json"
+    volumes:
+      - ./letsencrypt:/letsencrypt
+    restart: "no"
+
   traefik:
     image: traefik:v3.0
+    depends_on:
+      init_letsencrypt:
+        condition: service_completed_successfully
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
@@ -13,7 +24,6 @@ services:
       - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
-      # (Optional while debugging)
       # - --accesslog=true
       # - --log.level=DEBUG
     ports:
@@ -75,4 +85,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    n
+    networks: [web]
+    restart: unless-stopped
+
+networks:
+  web:
+    driver: bridge
