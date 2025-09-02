@@ -90,8 +90,7 @@ jobs:
 
             echo ">>> Clean old containers/images (keep volumes for certs)"
             docker stop $(docker ps -aq) || true
-            docker rm -f $(docker ps -aq) || true
-            docker image prune -af || true
+
 
             echo ">>> Pull new images and start services"
             docker-compose pull
