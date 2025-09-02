@@ -1,37 +1,35 @@
 import asyncio
+import base64
 import json
 import os
-import base64
 import time
+from typing import Dict, List, Optional
+
 import pyaudio
 import websockets
-import numpy as np  # optional
-import sounddevice as sd  # optional
-from playwright.async_api import async_playwright
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, List, Optional
 from jinja2 import Environment, FileSystemLoader
+from pydantic import BaseModel
 
-# ✅ Relative imports
+# ✅ your local modules
 from .services.openai_client import client
 from .voice.tts_player import StreamingTTSPlayer
 
 # =========================================================
-# ✅ Server config (env-driven)
+# Config
 # =========================================================
 ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
+API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 RATE = 16000
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-API_KEY = os.getenv("OPENAI_API_KEY")
 
 # =========================================================
-# ✅ FastAPI App + CORS
+# FastAPI + CORS
 # =========================================================
 app = FastAPI(title="Voice Assistant with Intent Routing")
 app.add_middleware(
@@ -45,49 +43,51 @@ app.add_middleware(
 tts_player = StreamingTTSPlayer()
 
 # =========================================================
-# ✅ Prompt Templates
+# Prompts
 # =========================================================
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 conversation_history: List[Dict[str, str]] = []
 
 
+def _env():
+    return Environment(loader=FileSystemLoader(PROMPT_DIR))
+
+
 def render_intent_prompt() -> str:
-    env = Environment(loader=FileSystemLoader(PROMPT_DIR))
-    template = env.get_template("intent_prompt.j2")
-    return template.render()
+    return _env().get_template("intent_prompt.j2").render()
 
 
 def render_system_prompt(session_id: str = "SESSION-001") -> str:
-    env = Environment(loader=FileSystemLoader(PROMPT_DIR))
-    template = env.get_template("system_prompt.j2")
-    return template.render(session_id=session_id)
+    return _env().get_template("system_prompt.j2").render(session_id=session_id)
 
 
 def render_summarization_prompt(search_context: str) -> str:
-    env = Environment(loader=FileSystemLoader(PROMPT_DIR))
-    template = env.get_template("summarization.j2")
-    return template.render(search_context=search_context)
+    return _env().get_template("summarization.j2").render(search_context=search_context)
 
 
 # =========================================================
-# ✅ Speak text (server speakers; no-op unless ENABLE_VOICE=1)
+# TTS helper (server speakers; only if ENABLE_VOICE=1)
 # =========================================================
 async def speak_tts(text: str):
-    if not ENABLE_VOICE:
+    if not ENABLE_VOICE or not text:
         return
-    # ensure previous playback halts before starting new
-    tts_player.stop()
-    async with client.audio.speech.with_streaming_response.create(
-        model="gpt-4o-mini-tts",
-        voice="nova",
-        input=text,
-        response_format="pcm",
-    ) as response:
-        await tts_player.play_pcm_stream(response)
+    try:
+        tts_player.stop()  # stop any previous playback
+        async with client.audio.speech.with_streaming_response.create(
+            model="gpt-4o-mini-tts",
+            voice="nova",
+            input=text,
+            response_format="pcm",
+        ) as response:
+            # play until done
+            await tts_player.play_pcm_stream(response)
+    except Exception:
+        # don't let TTS failure break the request
+        pass
 
 
 # =========================================================
-# ✅ GPT Intent Classification
+# Intent via GPT
 # =========================================================
 async def determine_intent_gpt(message: str) -> Dict[str, str]:
     system_prompt = render_intent_prompt()
@@ -101,16 +101,17 @@ async def determine_intent_gpt(message: str) -> Dict[str, str]:
         stream=False,
     )
     try:
-        parsed = json.loads(resp.choices[0].message.content)
+        return json.loads(resp.choices[0].message.content)
     except Exception:
-        parsed = {"intent": "unknown", "reason": "Could not parse GPT response."}
-    return parsed
+        return {"intent": "unknown", "reason": "Could not parse GPT response."}
 
 
 # =========================================================
-# ✅ Web Search via Playwright + GPT summary
+# (Optional) Web search via Playwright + summary
 # =========================================================
 async def bing_scrape(query: str):
+    from playwright.async_api import async_playwright  # lazy import (lighter startup)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -120,15 +121,16 @@ async def bing_scrape(query: str):
         except Exception:
             await browser.close()
             return []
-        elements = await page.query_selector_all("li.b_algo")
+
+        items = await page.query_selector_all("li.b_algo")
         results = []
-        for el in elements[:5]:
+        for el in items[:5]:
             title_el = await el.query_selector("h2 a")
             snippet_el = await el.query_selector(".b_caption p")
-            title = await title_el.inner_text() if title_el else ""
-            url = await title_el.get_attribute("href") if title_el else ""
-            snippet = await snippet_el.inner_text() if snippet_el else ""
-            results.append({"title": title.strip(), "snippet": snippet.strip(), "url": url.strip()})
+            title = (await title_el.inner_text()) if title_el else ""
+            url = (await title_el.get_attribute("href")) if title_el else ""
+            snippet = (await snippet_el.inner_text()) if snippet_el else ""
+            results.append({"title": title.strip(), "snippet": snippet.strip(), "url": (url or "").strip()})
         await browser.close()
         return results
 
@@ -139,9 +141,11 @@ async def do_web_scraping(query: str) -> str:
     except Exception:
         await speak_tts("I couldn’t fetch live search results right now.")
         return "I couldn’t fetch live search results."
+
     if not results:
         await speak_tts("I didn’t find any relevant search results.")
         return "I didn’t find any relevant search results."
+
     search_context = "\n".join([f"- {i['title']}: {i['snippet']} ({i['url']})" for i in results])
     summary_prompt = render_summarization_prompt(search_context)
     summary_resp = await client.chat.completions.create(
@@ -150,14 +154,19 @@ async def do_web_scraping(query: str) -> str:
         temperature=0.4,
         stream=False,
     )
-    summary_text = summary_resp.choices[0].message.content.strip()
-    await speak_tts(summary_text)
-    return summary_text
+    text = summary_resp.choices[0].message.content.strip()
+    await speak_tts(text)
+    return text
 
 
 # =========================================================
-# ✅ Routes
+# HTTP routes
 # =========================================================
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "Assistant is running!"}
+
+
 @app.get("/weather")
 async def get_weather():
     return {"forecast": "Sunny, 25°C"}
@@ -174,7 +183,6 @@ async def determine_intent(msg: ChatMessage):
 
     intent_data = await determine_intent_gpt(user_text)
     intent = intent_data.get("intent", "unknown")
-    reason = intent_data.get("reason", "")
 
     if intent == "weather":
         data = await get_weather()
@@ -192,23 +200,32 @@ async def determine_intent(msg: ChatMessage):
             stream=False,
         )
         result = chat_resp.choices[0].message.content.strip()
-        conversation_history += [{"role": "user", "content": user_text},
-                                 {"role": "assistant", "content": result}]
+        conversation_history += [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": result},
+        ]
         if len(conversation_history) > 40:
             conversation_history = conversation_history[-40:]
     else:
         result = "Hmm, I’m not sure what you mean."
 
     await speak_tts(result)
-    return {"intent": intent, "reason": reason, "result": result}
+    return {"intent": intent, "result": result}
 
 
 # =========================================================
-# ✅ Server mic loop (local dev only; off in production)
+# Server-mic loop (local dev only)
 # =========================================================
 async def mic_stream_vad():
+    if not API_KEY:
+        return
     uri = "wss://api.openai.com/v1/realtime?intent=transcription"
-    headers = [("Authorization", f"Bearer {API_KEY}"), ("OpenAI-Beta", "realtime=v1")]
+    headers = [
+        ("Authorization", f"Bearer {API_KEY}"),
+        ("OpenAI-Beta", "realtime=v1"),
+    ]
+    import pyaudio as _pa
+
     async with websockets.connect(uri, extra_headers=headers) as upstream:
         await upstream.send(json.dumps({
             "type": "transcription_session.update",
@@ -220,9 +237,8 @@ async def mic_stream_vad():
                 "input_audio_noise_reduction": {"type": "near_field"},
             },
         }))
-        audio = pyaudio.PyAudio()
-        stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
-                            frames_per_buffer=CHUNK)
+        audio = _pa.PyAudio()
+        stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
         async def send_audio():
             while True:
@@ -243,10 +259,8 @@ async def mic_stream_vad():
                     delta = evt.get("delta", "")
                     buf.setdefault(evt.get("item_id"), "")
                     buf[evt.get("item_id")] += delta
-                    print("✍️ Partial:", buf[evt.get("item_id")], end="\r")
                 elif et == "conversation.item.input_audio_transcription.completed":
                     user_text = evt.get("transcript", "")
-                    print(f"\n✅ You said: {user_text}")
                     await determine_intent(ChatMessage(message=user_text))
                     buf.pop(evt.get("item_id"), None)
 
@@ -254,7 +268,7 @@ async def mic_stream_vad():
 
 
 # =========================================================
-# ✅ TTS streaming to browser (cancelable session)
+# TTS streaming to the browser
 # =========================================================
 class TTSSession:
     def __init__(self):
@@ -262,7 +276,6 @@ class TTSSession:
         self.cancel_event = asyncio.Event()
 
     def cancel(self):
-        # signal streamers to stop and halt server audio immediately
         self.cancel_event.set()
         tts_player.stop()
         if self.task and not self.task.done():
@@ -274,10 +287,6 @@ class TTSSession:
 
 
 async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
-    """
-    Stream OpenAI TTS to the browser in real-time as PCM16 base64 chunks.
-    Also optional server playback if ENABLE_VOICE=1.
-    """
     SAMPLE_RATE = 24000
     await ws.send_text(json.dumps({"type": "tts_start", "sample_rate": SAMPLE_RATE}))
 
@@ -287,7 +296,7 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 model="gpt-4o-mini-tts",
                 voice="nova",
                 input=text,
-                response_format="pcm",  # raw PCM16 mono
+                response_format="pcm",
             ) as resp:
                 async for chunk in resp.iter_bytes():
                     if tts.cancel_event.is_set():
@@ -303,7 +312,6 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
         if not ENABLE_VOICE:
             return
         try:
-            # ensure previous playback halted
             tts_player.stop()
             async with client.audio.speech.with_streaming_response.create(
                 model="gpt-4o-mini-tts",
@@ -311,15 +319,16 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 input=text,
                 response_format="pcm",
             ) as resp:
-                # poll cancel flag between buffer writes
-                await tts_player.play_pcm_stream(resp, cancel_event=tts.cancel_event if hasattr(tts_player, "play_pcm_stream") else None)  # if your player supports it
+                # handle optional cancel_event arg gracefully
+                if "cancel_event" in tts_player.play_pcm_stream.__code__.co_varnames:
+                    await tts_player.play_pcm_stream(resp, cancel_event=tts.cancel_event)
+                else:
+                    await tts_player.play_pcm_stream(resp)
         except asyncio.CancelledError:
             pass
         except Exception:
-            # swallow server-audio errors to not break browser stream
             pass
 
-    # Run both, but cancel the sibling if one completes or is cancelled
     tasks = [asyncio.create_task(to_browser()), asyncio.create_task(to_server_speakers())]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
@@ -331,17 +340,19 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
 
 
 # =========================================================
-# ✅ Browser ↔ Server WebSocket for realtime streaming + barge-in
+# WebSockets
 # =========================================================
 @app.websocket("/ws/echo")
 async def ws_echo(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            data = await ws.receive_text()
-            await ws.send_text(f"echo:{data}")
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
     except WebSocketDisconnect:
         pass
+
+
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
     await ws.accept()
@@ -349,24 +360,19 @@ async def ws_stream(ws: WebSocket):
 
     uri = "wss://api.openai.com/v1/realtime?intent=transcription"
     headers = [
-        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY', '')}")),
+        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY', '')}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
 
     try:
         async with websockets.connect(uri, extra_headers=headers) as upstream:
-            # Configure transcription with sensitive VAD for instant pickup
             await upstream.send(json.dumps({
                 "type": "transcription_session.update",
                 "session": {
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.45,
-                        "prefix_padding_ms": 150,
-                        "silence_duration_ms": 250
-                    },
+                    "turn_detection": {"type": "server_vad", "threshold": 0.45,
+                                       "prefix_padding_ms": 150, "silence_duration_ms": 250},
                     "input_audio_noise_reduction": {"type": "near_field"},
                 },
             }))
@@ -379,39 +385,45 @@ async def ws_stream(ws: WebSocket):
                     except Exception:
                         break
 
-            # ---- Browser -> OpenAI ----
             async def forward_up():
                 try:
                     while True:
                         msg = await ws.receive_text()
-                        data = json.loads(msg)
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            # ignore non-JSON frames
+                            continue
 
-                        # Manual barge-in from client UI
-                        if data.get("type") == "barge_in":
+                        t = data.get("type")
+                        if t == "ping":
+                            await ws.send_text(json.dumps({"type": "pong", "t": time.time()}))
+                            continue
+
+                        if t == "barge_in":
                             tts.cancel()
                             await ws.send_text(json.dumps({"type": "tts_stop"}))
                             continue
 
-                        if data.get("type") == "audio":
+                        if t == "audio":
                             await upstream.send(json.dumps({
                                 "type": "input_audio_buffer.append",
-                                "audio": data["audio_b64"],
+                                "audio": data.get("audio_b64", ""),
                             }))
                             await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            continue
 
-                        elif data.get("type") == "flush":
+                        if t == "flush":
                             await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
                 except WebSocketDisconnect:
                     pass
 
-            # ---- OpenAI -> Browser ----
             async def forward_down():
                 async for raw in upstream:
                     evt = json.loads(raw)
                     t = evt.get("type")
 
                     if t == "input_audio_buffer.speech_started":
-                        # Auto barge-in when user starts speaking
                         tts.cancel()
                         await ws.send_text(json.dumps({"type": "tts_stop"}))
                         await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
@@ -421,15 +433,11 @@ async def ws_stream(ws: WebSocket):
 
                     elif t == "conversation.item.input_audio_transcription.completed":
                         user_text = evt.get("transcript", "")
-
-                        # Route intent
                         res = await determine_intent(ChatMessage(message=user_text))
                         reply = res.get("result", "")
 
-                        # Send text immediately
                         await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
 
-                        # Start NEW streaming TTS (cancel previous)
                         tts.cancel()
                         tts.reset()
                         tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
@@ -443,20 +451,11 @@ async def ws_stream(ws: WebSocket):
         except Exception:
             pass
     finally:
-        # ensure any TTS is stopped on disconnect
         tts.cancel()
 
 
 # =========================================================
-# ✅ Healthcheck
-# =========================================================
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Assistant is running!"}
-
-
-# =========================================================
-# ✅ Startup (server mic only if enabled)
+# Startup
 # =========================================================
 @app.on_event("startup")
 async def startup_event():
@@ -467,9 +466,6 @@ async def startup_event():
         print("🛑 Voice loop disabled (ENABLE_VOICE=0) — using browser mic via /ws/stream.")
 
 
-# =========================================================
-# ✅ Uvicorn entry
-# =========================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("assistant.app:app", host="0.0.0.0", port=8000, reload=True)
