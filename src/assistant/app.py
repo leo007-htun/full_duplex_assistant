@@ -333,6 +333,15 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
 # =========================================================
 # ✅ Browser ↔ Server WebSocket for realtime streaming + barge-in
 # =========================================================
+@app.websocket("/ws/echo")
+async def ws_echo(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_text()
+            await ws.send_text(f"echo:{data}")
+    except WebSocketDisconnect:
+        pass
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
     await ws.accept()
