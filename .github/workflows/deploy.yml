@@ -88,8 +88,10 @@ jobs:
               ls -la web || true
             fi
 
-            echo ">>> Clean old containers/images (keep volumes for certs)"
+            echo ">>> Clean old containers/images (keep volumes for certs)""
             docker stop $(docker ps -aq) || true
+            docker rm -f $(docker ps -aq) || true
+            docker rmi -f $(docker images -q) || true
 
 
             echo ">>> Pull new images and start services"
