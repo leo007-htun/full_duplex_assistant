@@ -8,6 +8,9 @@
     body{font-family:system-ui;margin:2rem;max-width:800px}
     button{padding:.6rem 1rem;margin-right:.5rem}
     pre{background:#f6f6f6;padding:1rem;border-radius:.5rem;white-space:pre-wrap}
+    .status{font-size:.9rem;color:#666;margin:.5rem 0}
+    .error{color:#b00020}
+    .ok{color:#0a7b22}
   </style>
 </head>
 <body>
@@ -16,23 +19,25 @@
 
   <button id="start">🎙️ Start</button>
   <button id="stop" disabled>⏹️ Stop</button>
+  <div class="status" id="status">Idle</div>
 
   <p><strong>Partial:</strong> <span id="partial"></span></p>
   <pre id="final"></pre>
 
   <script>
-  // Use your current origin automatically (avoids hardcoding domain)
-  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/stream';
+  const WS_PATH = '/ws/stream';
+  const WS_URL  = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + WS_PATH;
 
-  let ws, audioCtx, processor, src, stream, running=false, ttsPlayer=null;
+  let ws, pingTimer, audioCtx, processor, src, stream, running=false, ttsPlayer=null;
 
+  // --- Tiny PCM streamer (ScriptProcessorNode; fine for MVP) ---
   class PCMStreamer {
     constructor(targetRate=24000){
       this.ctx = new (window.AudioContext||window.webkitAudioContext)();
       this.deviceRate = this.ctx.sampleRate;      // ~48000
       this.targetRate = targetRate;
       this.q = [];
-      this.node = this.ctx.createScriptProcessor(2048,1,1); // smaller = lower latency
+      this.node = this.ctx.createScriptProcessor(2048,1,1);
       this.node.onaudioprocess = e => this._pull(e);
       this.node.connect(this.ctx.destination);
     }
@@ -79,24 +84,45 @@
     return out;
   }
 
-  async function start(){
-    if(running) return; running=true;
+  // --- Helpers ---
+  const $ = (id)=>document.getElementById(id);
+  function setStatus(text, ok=false, err=false){
+    const el=$('status'); el.textContent=text; el.classList.toggle('ok',ok); el.classList.toggle('error',err);
+  }
 
-    ws = new WebSocket(WS_URL);
-    ws.onmessage = (e)=>{
-      const m = JSON.parse(e.data);
-
-      if(m.type==="partial"){ document.getElementById("partial").textContent = m.text; }
+  function attachWSHandlers(socket){
+    console.log("WS_URL =", WS_URL);
+    socket.onopen = () => {
+      console.log("[WS] open");
+      setStatus("WebSocket connected ✔", true, false);
+      // light keepalive
+      pingTimer = setInterval(()=> {
+        if (socket.readyState === WebSocket.OPEN) {
+          try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch {}
+        }
+      }, 20000);
+    };
+    socket.onerror = (e) => {
+      console.error("[WS] error", e);
+      setStatus("WebSocket error", false, true);
+    };
+    socket.onclose = (e) => {
+      console.warn("[WS] close", e.code, e.reason);
+      setStatus(`WebSocket closed (${e.code})`, false, true);
+      if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+    };
+    socket.onmessage = (evt) => {
+      const m = JSON.parse(evt.data);
+      if(m.type==="partial"){ $('partial').textContent = m.text; }
       if(m.type==="final"){
-        document.getElementById("partial").textContent = "";
-        document.getElementById("final").textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
+        $('partial').textContent = "";
+        $('final').textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
       }
-
-      // >>> TTS streaming <<<
+      // TTS streaming
       if(m.type==="tts_start"){
         if(ttsPlayer) ttsPlayer.stop();
         ttsPlayer = new PCMStreamer(m.sample_rate||24000);
-        ttsPlayer.ctx.resume(); // ensure audio allowed after user click
+        ttsPlayer.ctx.resume();
       }
       if(m.type==="tts_chunk" && ttsPlayer){
         ttsPlayer.pushB64PCM16(m.pcm_b64);
@@ -104,15 +130,61 @@
       if(m.type==="tts_end"){
         setTimeout(()=>{ if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }}, 300);
       }
-      // >>> INSTANT STOP cues <<<
+      // INSTANT STOP cues
       if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
         if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
       }
     };
+  }
 
-    // mic → tiny frames → WS
-    stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  function waitForOpen(socket, timeoutMs=8000){
+    return new Promise((resolve, reject)=>{
+      if (socket.readyState === WebSocket.OPEN) return resolve();
+      const onOpen = ()=>{ cleanup(); resolve(); };
+      const onErr  = (e)=>{ cleanup(); reject(e); };
+      const onClose= (e)=>{ cleanup(); reject(new Error(`closed ${e.code}`)); };
+      const timer = setTimeout(()=>{ cleanup(); reject(new Error("ws open timeout")); }, timeoutMs);
+      function cleanup(){
+        clearTimeout(timer);
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('error', onErr);
+        socket.removeEventListener('close', onClose);
+      }
+      socket.addEventListener('open', onOpen);
+      socket.addEventListener('error', onErr);
+      socket.addEventListener('close', onClose);
+    });
+  }
+
+  async function start(){
+    if(running) return; running=true;
+    setStatus("Connecting WebSocket…");
+
+    // 1) Connect WS first, fail fast if routing is broken
+    ws = new WebSocket(WS_URL);
+    attachWSHandlers(ws);
+    try {
+      await waitForOpen(ws, 12000);
+    } catch (e) {
+      console.error("WS failed to open:", e);
+      setStatus("WebSocket failed to open. Check /ws routing.", false, true);
+      running=false;
+      return;
+    }
+
+    // 2) Ask for mic and start streaming frames
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      console.error("getUserMedia error:", e);
+      setStatus("Mic permission denied.", false, true);
+      running=false;
+      return;
+    }
+
     audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
+    if (audioCtx.state === 'suspended') { try{ await audioCtx.resume(); }catch{} }
+
     const srcNode = audioCtx.createMediaStreamSource(stream);
     const proc = audioCtx.createScriptProcessor(1024,1,1); // ~21ms @48k
     srcNode.connect(proc); proc.connect(audioCtx.destination);
@@ -123,29 +195,39 @@
       const input = e.inputBuffer.getChannelData(0);
       const ds = downsample(input, audioCtx.sampleRate, 16000);
       const i16 = f32ToI16(ds);
-      ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) }));
+      try{
+        ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) }));
+      }catch(err){
+        // swallow transient send errors
+      }
     };
 
-    document.getElementById("start").disabled = true;
-    document.getElementById("stop").disabled = false;
+    $('start').disabled = true;
+    $('stop').disabled = false;
+    setStatus("Streaming… speak any time.", true, false);
   }
 
   function stop(){
     running=false;
-    // also tell server to kill any TTS immediately
-    if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({ type:"barge_in" }));
-    try{ processor.disconnect(); }catch{}
-    try{ src.disconnect(); }catch{}
-    try{ stream.getTracks().forEach(t=>t.stop()); }catch{}
-    try{ audioCtx.close(); }catch{}
-    try{ ws.close(); }catch{}
+    // tell server to kill any TTS immediately
+    try{ if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({ type:"barge_in" })); }catch{}
+    try{ processor && processor.disconnect(); }catch{}
+    try{ src && src.disconnect(); }catch{}
+    try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
+    try{ audioCtx && audioCtx.close(); }catch{}
+    try{ pingTimer && clearInterval(pingTimer); pingTimer=null; }catch{}
+    try{ ws && ws.close(); }catch{}
     if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
-    document.getElementById("start").disabled = false;
-    document.getElementById("stop").disabled = true;
+    $('start').disabled = false;
+    $('stop').disabled = true;
+    setStatus("Stopped.");
   }
 
-  document.getElementById("start").onclick = start;   // user gesture unlocks audio
-  document.getElementById("stop").onclick  = stop;
+  $('start').onclick = start;   // user gesture unlocks audio
+  $('stop').onclick  = stop;
+
+  // Close WS cleanly if user leaves
+  window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch{} });
   </script>
 </body>
 </html>
