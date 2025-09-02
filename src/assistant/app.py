@@ -230,12 +230,25 @@ async def mic_stream_vad():
         await upstream.send(json.dumps({
             "type": "transcription_session.update",
             "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
-                "turn_detection": {"type": "server_vad", "threshold": 0.5,
-                                   "prefix_padding_ms": 300, "silence_duration_ms": 500},
-                "input_audio_noise_reduction": {"type": "near_field"},
-            },
+                # Option A: structured format
+                "input_audio_format": { "type": "pcm16", "sample_rate_hz": 16000 },
+        
+                # OR Option B: flat fields (if your SDK expects this)
+                # "input_audio_format": "pcm16",
+                # "sample_rate_hz": 16000,
+        
+                "input_audio_transcription": {
+                    "model": "gpt-4o-mini-transcribe",
+                    "language": "en"
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.32,            # was 0.45
+                    "prefix_padding_ms": 300,     # was 150
+                    "silence_duration_ms": 350    # was 250
+                },
+                "input_audio_noise_reduction": { "type": "near_field" }
+            }
         }))
         audio = _pa.PyAudio()
         stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
@@ -422,25 +435,35 @@ async def ws_stream(ws: WebSocket):
                 async for raw in upstream:
                     evt = json.loads(raw)
                     t = evt.get("type")
-
+            
+                    if t in ("error", "response.error"):
+                        print("upstream error:", evt)
+                    else:
+                        # Optional: brief heartbeat for visibility
+                        if t not in (
+                            "conversation.item.input_audio_transcription.delta",
+                            "input_audio_buffer.speech_started",
+                            "conversation.item.input_audio_transcription.completed",
+                        ):
+                            print("upstream evt:", t)
+            
                     if t == "input_audio_buffer.speech_started":
                         tts.cancel()
                         await ws.send_text(json.dumps({"type": "tts_stop"}))
                         await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
-
+            
                     elif t == "conversation.item.input_audio_transcription.delta":
                         await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
-
+            
                     elif t == "conversation.item.input_audio_transcription.completed":
                         user_text = evt.get("transcript", "")
                         res = await determine_intent(ChatMessage(message=user_text))
                         reply = res.get("result", "")
-
                         await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
-
                         tts.cancel()
                         tts.reset()
                         tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
+
 
             await asyncio.gather(ping(), forward_up(), forward_down())
 
