@@ -14,6 +14,9 @@
     .listen{color:#b00020;font-weight:bold}
     .speak{color:#0066cc;font-weight:bold}
     .muted{opacity:.6}
+    #meter{width:220px;height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:.4rem 0}
+    #bar{height:100%;width:0;background:#0a7b22;transition:width .05s linear}
+    #log{white-space:pre-wrap;background:#fafafa;border:1px solid #eee;border-radius:6px;padding:8px;max-height:220px;overflow:auto}
   </style>
 </head>
 <body>
@@ -25,10 +28,15 @@
     <button id="stop"  disabled>⏹️ Stop</button>
     <button id="echo"  class="muted" title="Quick WS routing test">🔎 Test Echo</button>
   </div>
+
   <div class="status" id="status">Idle</div>
+  <div id="meter"><div id="bar"></div></div>
 
   <p><strong>Partial:</strong> <span id="partial"></span></p>
   <pre id="final"></pre>
+
+  <h3>Logs</h3>
+  <pre id="log"></pre>
 
 <script>
 /* =========================
@@ -50,6 +58,8 @@ let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
    Helpers
 ========================= */
 const $ = id => document.getElementById(id);
+const log = (...a)=>{ console.log(...a); $('log').textContent += a.join(' ') + '\n'; };
+
 function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
 
 // base64 PCM16LE -> Float32 [-1,1]
@@ -80,6 +90,8 @@ function resampleLinear(f32, srcRate, dstRate){
 }
 function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
+function setMeter(level01){ $('bar').style.width = Math.min(1,Math.max(0,level01))*220 + 'px'; }
+function rms(samples){ let s=0; for(let i=0;i<samples.length;i++){ const v=samples[i]; s+=v*v; } return Math.sqrt(s/Math.max(1,samples.length)); }
 
 /* =========================
    TTS via AudioWorkletNode
@@ -87,7 +99,13 @@ function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i
 async function ensureTTSContext(sampleRateHint=24000){
   if (ttsCtx && ttsNode) return;
   ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
-  await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // your TTS worklet
+  try {
+    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // your TTS worklet
+  } catch (e) {
+    console.error('Failed to load /pcm-player-processor.js', e);
+    setStatus('Failed to load TTS worklet','error');
+    throw e;
+  }
   ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
   ttsNode.connect(ttsCtx.destination);
 }
@@ -98,7 +116,7 @@ function ttsStop(){ try { ttsNode?.disconnect(); } catch {}; try { ttsCtx?.close
    WebSocket lifecycle
 ========================= */
 function attachWS(socket){
-  console.log("WS_URL =", WS_URL);
+  log("WS_URL =", WS_URL);
   socket.onopen = ()=>{
     setStatus("WebSocket connected ✔","ok");
     wsRetry=0;
@@ -170,15 +188,32 @@ async function start(){
     setStatus("WS failed to open","error"); running=false; return;
   }
 
-  // 2) Mic permission
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  // 2) Mic permission (mono + noise controls help VAD)
+  try { 
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    }); 
+    log('Mic stream granted');
+  }
   catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
 
   // 3) AudioContext and mic capture via Worklet
   audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
+  log('AudioContext rate =', audioCtx.sampleRate);
   if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); }catch{} }
 
-  await audioCtx.audioWorklet.addModule('/mic-capture-processor.js'); // your mic worklet
+  try {
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js'); // your mic worklet
+  } catch (e) {
+    console.error('Failed to load /mic-capture-processor.js', e);
+    setStatus('Failed to load mic worklet','error');
+    running=false; return;
+  }
 
   const srcNode = audioCtx.createMediaStreamSource(stream);
   const micNodeLocal = new AudioWorkletNode(audioCtx, 'mic-capture', {
@@ -188,16 +223,29 @@ async function start(){
     processorOptions: { downsampleTo: 16000, postIntervalMs: 100 }
   });
 
-  // send captured (downsampled) audio to the server
+  let framesSent = 0;
+
   micNodeLocal.port.onmessage = (e)=>{
-    const { type, samples } = e.data || {};
+    const { type, samples, rate } = e.data || {};
+
+    // optional debug message from worklet (if you add it there)
+    if (type === 'debug' && rate) { log('Worklet rate =', rate); return; }
+
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
+      // live meter for confidence
+      setMeter(rms(samples) * 1.8);
+
       const i16 = f32ToI16(samples);
-      try { ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) })); } catch {}
+      try { 
+        ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) })); 
+        if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
+      } catch (err) {
+        console.error('WS send failed', err);
+      }
     }
   };
 
-  // keep node in the graph but muted
+  // keep node in the graph but muted (prevents Chrome GC)
   micSink = audioCtx.createGain(); micSink.gain.value = 0;
   srcNode.connect(micNodeLocal); micNodeLocal.connect(micSink); micSink.connect(audioCtx.destination);
 
