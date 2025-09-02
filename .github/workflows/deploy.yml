@@ -86,11 +86,49 @@ jobs:
             cd "$REPO_PATH"
             git fetch --all --prune
             git reset --hard origin/main
+<<<<<<< HEAD
       
             echo "== detect compose file =="
             COMPOSE_FILE=""
             for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
               if [ -f "$f" ]; then COMPOSE_FILE="$f"; break; fi
+=======
+
+            # write app env (server only, NOT committed)
+            mkdir -p src/assistant
+            cat > src/assistant/.env << 'EOF'
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            ALLOWED_ORIGINS=https://com-cloud.cloud
+            ENABLE_VOICE=0
+            EOF
+
+            # write root .env with ACME email + IMAGE_TAG to pin
+            cat > .env << 'EOF'
+            LE_EMAIL=${{ secrets.LE_EMAIL }}
+            IMAGE_TAG=${{ needs.build_push.outputs.tag }}
+            EOF
+
+            # ensure static site exists (fix path if needed)
+            if [ ! -f ./web/index.html ]; then
+              echo "WARNING: full_duplex_assistant_v1/web/index.html missing. Check compose volume path."
+              ls -la full_duplex_assistant_v1 || true
+            fi
+
+            echo ">>> Cleaning up old containers and images..."
+            docker stop $(docker ps -aq) || true
+            docker rm -f $(docker ps -aq) || true
+            docker rmi -f $(docker images -q) || true
+            docker system prune -af --volumes || true
+
+            echo ">>> Pulling new images and deploying..."
+            docker-compose pull assistant
+            docker-compose up -d --remove-orphans
+
+            # basic smoke test (HTTPS)
+            for i in {1..30}; do
+              curl -fsS "https://com-cloud.cloud/" >/dev/null && break
+              sleep 5
+>>>>>>> d774937 (v20)
             done
             if [ -z "$COMPOSE_FILE" ]; then
               echo "❌ No compose file found in $(pwd)"; ls -la; exit 1
