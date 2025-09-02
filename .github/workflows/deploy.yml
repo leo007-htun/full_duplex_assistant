@@ -20,7 +20,7 @@ jobs:
 
       - name: Short SHA
         id: vars
-        run: echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -41,7 +41,6 @@ jobs:
           tags: |
             sithuyehtun/full_duplex_assistant:latest
             sithuyehtun/full_duplex_assistant:${{ steps.vars.outputs.sha_short }}
-
   deploy:
     needs: build_push
     runs-on: ubuntu-latest
@@ -59,32 +58,36 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-
-            echo "== connected ==" && whoami || true && uname -a || true && date
-
-            # ---- Compose detection ----
+      
+            echo "== connected =="
+            whoami || true
+            uname -a || true
+            date
+      
+            # ==== Compose detection (NO unguarded calls) ====
             if docker compose version >/dev/null 2>&1; then
               COMPOSE="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
             else
-              echo "❌ Neither 'docker compose' nor 'docker-compose' found"; exit 1
+              echo "❌ Neither 'docker compose' nor 'docker-compose' is installed."; exit 1
             fi
             echo "Using COMPOSE=$COMPOSE"
             $COMPOSE version || true
-
-            # ---- Repo checkout/update ----
+      
             REPO_PATH="${{ secrets.SERVER_PATH }}"
             echo "REPO_PATH=$REPO_PATH"
+      
+            echo "== prepare repo =="
             mkdir -p "$REPO_PATH"
             if [ ! -d "$REPO_PATH/.git" ]; then
-              git clone "https://github.com/${{ github.repository }}" "$REPO_PATH"
+              git clone https://github.com/${{ github.repository }} "$REPO_PATH"
             fi
             cd "$REPO_PATH"
             git fetch --all --prune
             git reset --hard origin/main
-
-            # ---- Detect compose file (early) ----
+      
+            echo "== detect compose file =="
             COMPOSE_FILE=""
             for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
               if [ -f "$f" ]; then COMPOSE_FILE="$f"; break; fi
@@ -94,39 +97,38 @@ jobs:
             fi
             echo "Using compose file: $COMPOSE_FILE"
             $COMPOSE -f "$COMPOSE_FILE" config >/dev/null
-
-            # ---- Write env files used by compose ----
+      
+            echo "== write env files =="
             mkdir -p src/assistant
-            cat > src/assistant/.env << 'EOF'
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            ALLOWED_ORIGINS=https://com-cloud.cloud
-            ENABLE_VOICE=0
-            EOF
-
-            cat > .env << 'EOF'
-            LE_EMAIL=${{ secrets.LE_EMAIL }}
-            IMAGE_TAG=${{ needs.build_push.outputs.tag }}
-            EOF
-
-            # ---- Ensure ACME store for Traefik ----
+            printf 'OPENAI_API_KEY=%s\nALLOWED_ORIGINS=%s\nENABLE_VOICE=0\n' \
+              "${{ secrets.OPENAI_API_KEY }}" "https://com-cloud.cloud" \
+              > src/assistant/.env
+      
+            printf 'LE_EMAIL=%s\nIMAGE_TAG=%s\n' \
+              "${{ secrets.LE_EMAIL }}" "${{ needs.build_push.outputs.tag }}" \
+              > .env
+      
+            echo "== ensure ACME store (bind mount ./letsencrypt) =="
             mkdir -p ./letsencrypt
             [ -f ./letsencrypt/acme.json ] || : > ./letsencrypt/acme.json
             chmod 600 ./letsencrypt/acme.json || true
             ls -l ./letsencrypt || true
-
-            # ---- Optional: sanity for static site ----
-            if [ ! -f ./web/index.html ]; then
-              echo "WARNING: ./web/index.html missing"
-            fi
-
-            # ---- Restart only this project ----
+      
+            echo "== stop project only =="
             $COMPOSE -f "$COMPOSE_FILE" down --remove-orphans || true
+      
+            echo "== prune unused =="
+            docker image prune -af || true
+            docker builder prune -af || true
+      
+            echo "== pull & up =="
             $COMPOSE -f "$COMPOSE_FILE" pull
             $COMPOSE -f "$COMPOSE_FILE" up -d --remove-orphans
-
-            echo "== ps ==" && $COMPOSE -f "$COMPOSE_FILE" ps || true
-
-            # ---- Local HTTPS check via Traefik (SNI Host header) ----
+      
+            echo "== ps =="
+            $COMPOSE -f "$COMPOSE_FILE" ps || true
+      
+            echo "== local https check =="
             for i in {1..30}; do
               if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
                 echo "Local HTTPS OK"; break
@@ -134,8 +136,8 @@ jobs:
               sleep 2
               if [ $i -eq 30 ]; then echo "Local HTTPS FAILED"; exit 1; fi
             done
-
-            # ---- Public HTTPS check ----
+      
+            echo "== public https check =="
             for i in {1..30}; do
               if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
                 echo "Public HTTPS OK"; break
@@ -143,5 +145,5 @@ jobs:
               sleep 5
               if [ $i -eq 30 ]; then echo "Public HTTPS FAILED"; exit 1; fi
             done
-
+      
             echo "Deployed tag: ${{ needs.build_push.outputs.tag }}"
