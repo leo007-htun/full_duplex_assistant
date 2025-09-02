@@ -42,7 +42,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
-      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`)"
+      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`) && !PathPrefix(`/ws`) && !PathPrefix(`/ws/`)"
       - "traefik.http.routers.web.entrypoints=websecure"
       - "traefik.http.routers.web.tls=true"
       - "traefik.http.routers.web.tls.certresolver=letsencrypt"
