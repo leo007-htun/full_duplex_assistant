@@ -86,13 +86,6 @@ jobs:
             cd "$REPO_PATH"
             git fetch --all --prune
             git reset --hard origin/main
-<<<<<<< HEAD
-      
-            echo "== detect compose file =="
-            COMPOSE_FILE=""
-            for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
-              if [ -f "$f" ]; then COMPOSE_FILE="$f"; break; fi
-=======
 
             # write app env (server only, NOT committed)
             mkdir -p src/assistant
@@ -128,7 +121,6 @@ jobs:
             for i in {1..30}; do
               curl -fsS "https://com-cloud.cloud/" >/dev/null && break
               sleep 5
->>>>>>> d774937 (v20)
             done
             if [ -z "$COMPOSE_FILE" ]; then
               echo "❌ No compose file found in $(pwd)"; ls -la; exit 1
