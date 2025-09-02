@@ -13,15 +13,14 @@ services:
       - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
-      # >>> Increase backend timeouts for long-lived WS <<<
-      - --serversTransport.forwardingTimeouts.dialTimeout=30s
-      - --serversTransport.forwardingTimeouts.responseHeaderTimeout=60s
-      - --serversTransport.forwardingTimeouts.idleTimeout=300s
+      # (Optional, while debugging to avoid LE rate limits)
+      # - --certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - traefik_letsencrypt:/letsencrypt
+      # Bind mount so you can chmod 600 without sudo inside container volumes
+      - ./letsencrypt:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [web]
     restart: unless-stopped
@@ -60,7 +59,7 @@ services:
       - traefik.http.routers.ws.middlewares=ws-headers
       - traefik.http.services.ws.loadbalancer.server.port=8000
 
-      # Explicit WS upgrade headers (belt & suspenders)
+      # Explicit WS upgrade headers (extra-safe)
       - traefik.http.middlewares.ws-headers.headers.customrequestheaders.Upgrade=websocket
       - traefik.http.middlewares.ws-headers.headers.customrequestheaders.Connection=Upgrade
 
@@ -81,6 +80,3 @@ services:
 networks:
   web:
     driver: bridge
-
-volumes:
-  traefik_letsencrypt:
