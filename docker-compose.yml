@@ -1,7 +1,6 @@
 version: "3.9"
 
 services:
-  # One-shot init to ensure ./letsencrypt/acme.json exists with 0600
   init_letsencrypt:
     image: alpine:3.20
     command: sh -c "mkdir -p /letsencrypt && touch /letsencrypt/acme.json && chmod 600 /letsencrypt/acme.json"
@@ -22,12 +21,10 @@ services:
       - --entrypoints.web.http.redirections.entryPoint.to=websecure
       - --entrypoints.web.http.redirections.entryPoint.scheme=https
       - --entryPoints.websecure.transport.respondingTimeouts.idleTimeout=0
-      - --serverstransport.forwardingTimeouts.idleConnTimeout=0
+      - --serversTransport.forwardingTimeouts.idleConnTimeout=0   # <- fixed casing
       - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
-      # - --accesslog=true
-      # - --log.level=DEBUG
     ports:
       - "80:80"
       - "443:443"
@@ -44,27 +41,24 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
-      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`) && !PathPrefix(`/ws`) && !PathPrefix(`/ws/`)"
+      # Optional: explicitly exclude /api from the static site
+      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`) && !PathPrefix(`/ws`) && !PathPrefix(`/ws/`) && !PathPrefix(`/api`)"
       - "traefik.http.routers.web.entrypoints=websecure"
       - "traefik.http.routers.web.tls=true"
       - "traefik.http.routers.web.tls.certresolver=letsencrypt"
       - "traefik.http.routers.web.priority=1"
       - "traefik.http.services.web.loadbalancer.server.port=80"
-      - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
-      - "traefik.http.routers.api.middlewares=api-strip@docker"
     networks: [web]
     restart: unless-stopped
 
   assistant:
     image: sithuyehtun/full_duplex_assistant:${IMAGE_TAG:-latest}
-
     command: >
       uvicorn assistant.app:app
       --host 0.0.0.0
       --port 8000
       --proxy-headers
-      --forwarded-allow-ips="*"
-
+      --forwarded-allow-ips=*
     env_file:
       - ./src/assistant/.env
     environment:
@@ -92,8 +86,16 @@ services:
       - "traefik.http.routers.api.tls.certresolver=letsencrypt"
       - "traefik.http.routers.api.priority=50"
       - "traefik.http.routers.api.service=assistant-svc"
+
+      # ===== Strip /api before hitting FastAPI =====
+      - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.api.middlewares=api-strip@docker"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/"]
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/').status==200 else 1)\nPY",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
