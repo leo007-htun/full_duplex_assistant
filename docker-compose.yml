@@ -13,6 +13,10 @@ services:
       - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      # >>> Increase backend timeouts for long-lived WS <<<
+      - --serversTransport.forwardingTimeouts.dialTimeout=30s
+      - --serversTransport.forwardingTimeouts.responseHeaderTimeout=60s
+      - --serversTransport.forwardingTimeouts.idleTimeout=300s
     ports:
       - "80:80"
       - "443:443"
@@ -25,7 +29,6 @@ services:
   web:
     image: nginx:alpine
     volumes:
-      # ✅ fix this path if your folder is actually 'full_duplex_assistant_v1'
       - ./web:/usr/share/nginx/html:ro
     labels:
       - traefik.enable=true
@@ -38,7 +41,6 @@ services:
     restart: unless-stopped
 
   assistant:
-    # 👇 CI will set IMAGE_TAG to the commit SHA; default to latest
     image: sithuyehtun/full_duplex_assistant:${IMAGE_TAG:-latest}
     env_file:
       - ./src/assistant/.env
@@ -49,11 +51,20 @@ services:
       - "8000"
     labels:
       - traefik.enable=true
+
+      # ===== WebSocket route =====
       - traefik.http.routers.ws.rule=Host(`com-cloud.cloud`) && PathPrefix(`/ws`)
       - traefik.http.routers.ws.entrypoints=websecure
       - traefik.http.routers.ws.tls.certresolver=letsencrypt
       - traefik.http.routers.ws.priority=100
+      - traefik.http.routers.ws.middlewares=ws-headers
       - traefik.http.services.ws.loadbalancer.server.port=8000
+
+      # Explicit WS upgrade headers (belt & suspenders)
+      - traefik.http.middlewares.ws-headers.headers.customrequestheaders.Upgrade=websocket
+      - traefik.http.middlewares.ws-headers.headers.customrequestheaders.Connection=Upgrade
+
+      # ===== REST route =====
       - traefik.http.routers.api.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)
       - traefik.http.routers.api.entrypoints=websecure
       - traefik.http.routers.api.tls.certresolver=letsencrypt
