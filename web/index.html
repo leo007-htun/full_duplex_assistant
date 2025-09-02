@@ -6,172 +6,238 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body{font-family:system-ui;margin:2rem;max-width:800px}
-    button{padding:.6rem 1rem;margin-right:.5rem}
+    button{padding:.6rem 1rem;margin:.25rem .5rem .25rem 0}
     pre{background:#f6f6f6;padding:1rem;border-radius:.5rem;white-space:pre-wrap}
     .status{font-size:.95rem;margin:.5rem 0}
     .ok{color:#0a7b22}
     .error{color:#b00020}
     .listen{color:#b00020;font-weight:bold}
     .speak{color:#0066cc;font-weight:bold}
+    .muted{opacity:.6}
   </style>
 </head>
 <body>
   <h1>Realtime Voice</h1>
   <p>Click Start to grant mic access. Speak any time — TTS will stop instantly when you talk.</p>
 
-  <button id="start">🎙️ Start</button>
-  <button id="stop" disabled>⏹️ Stop</button>
+  <div>
+    <button id="start">🎙️ Start</button>
+    <button id="stop"  disabled>⏹️ Stop</button>
+    <button id="echo"  class="muted" title="Quick WS routing test">🔎 Test Echo</button>
+  </div>
   <div class="status" id="status">Idle</div>
 
   <p><strong>Partial:</strong> <span id="partial"></span></p>
   <pre id="final"></pre>
 
-  <script>
-  const WS_PATH = '/ws/stream';
-  const WS_URL  = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + WS_PATH;
+<script>
+/* =========================
+   URLs & globals
+========================= */
+const WS_PATH  = '/ws/stream';
+const ECHO_PATH= '/ws/echo';           // backend echo endpoint (add in FastAPI for quick routing test)
+const WS_URL   = (location.protocol==='https:'?'wss://':'ws://') + location.host + WS_PATH;
+const ECHO_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host + ECHO_PATH;
 
-  let ws, audioCtx, workletNode, stream, running=false, ttsPlayer=null, pingTimer;
+let ws, wsRetry=0, pingTimer=null;
+let audioCtx=null, micNode=null, stream=null, running=false;
+let ttsPlayer=null;
 
-  // --- PCM streamer for TTS ---
-  class PCMStreamer {
-    constructor(targetRate=24000){
-      this.ctx = new (window.AudioContext||window.webkitAudioContext)();
-      this.deviceRate = this.ctx.sampleRate;
-      this.targetRate = targetRate;
-      this.q = [];
-      this.node = this.ctx.createScriptProcessor(2048,1,1);
-      this.node.onaudioprocess = e => this._pull(e);
-      this.node.connect(this.ctx.destination);
+/* =========================
+   Tiny PCM streamer for TTS
+========================= */
+class PCMStreamer {
+  constructor(targetRate=24000){
+    this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+    this.deviceRate = this.ctx.sampleRate;
+    this.targetRate = targetRate;
+    this.q = [];
+    this.node = this.ctx.createScriptProcessor(2048,1,1);
+    this.node.onaudioprocess = e => this._pull(e);
+    this.node.connect(this.ctx.destination);
+  }
+  stop(){ try{this.node.disconnect()}catch{}; try{this.ctx.close()}catch{}; this.q=[]; }
+  pushB64PCM16(b64){
+    const bin = atob(b64), buf = new ArrayBuffer(bin.length), u8 = new Uint8Array(buf);
+    for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+    this.pushPCM16(new Int16Array(buf));
+  }
+  pushPCM16(int16){
+    const f32 = new Float32Array(int16.length);
+    for(let i=0;i<int16.length;i++) f32[i] = int16[i]/0x8000;
+    this.q.push(resampleLinear(f32, this.targetRate, this.deviceRate));
+  }
+  _pull(e){
+    const out = e.outputBuffer.getChannelData(0);
+    let off=0;
+    while(off<out.length && this.q.length){
+      const frame=this.q[0], take=Math.min(out.length-off, frame.length);
+      out.set(frame.subarray(0,take), off);
+      off+=take;
+      if(take<frame.length) this.q[0]=frame.subarray(take); else this.q.shift();
     }
-    stop(){ try{this.node.disconnect()}catch{}; try{this.ctx.close()}catch{}; this.q=[]; }
-    pushB64PCM16(b64){
-      const bin = atob(b64), buf = new ArrayBuffer(bin.length), u8 = new Uint8Array(buf);
-      for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
-      this.pushPCM16(new Int16Array(buf));
-    }
-    pushPCM16(int16){
-      const f32 = new Float32Array(int16.length);
-      for(let i=0;i<int16.length;i++) f32[i] = int16[i]/0x8000;
-      this.q.push(resampleLinear(f32, this.targetRate, this.deviceRate));
-    }
-    _pull(e){
-      const out = e.outputBuffer.getChannelData(0);
-      let off=0;
-      while(off<out.length && this.q.length){
-        const frame=this.q[0], take=Math.min(out.length-off, frame.length);
-        out.set(frame.subarray(0,take), off);
-        off+=take;
-        if(take<frame.length) this.q[0]=frame.subarray(take); else this.q.shift();
+    if(off<out.length) out.fill(0,off);
+  }
+}
+function resampleLinear(f32,inR,outR){
+  if(inR===outR) return f32;
+  const ratio=outR/inR, out=new Float32Array(Math.floor(f32.length*ratio));
+  let pos=0;
+  for(let i=0;i<out.length;i++){
+    const idx=pos|0, frac=pos-idx, a=f32[idx]||0, b=f32[idx+1]||0;
+    out[i]=a+(b-a)*frac; pos+=1/ratio;
+  }
+  return out;
+}
+function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
+function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
+function downsample(buf,inRate,outRate=16000){
+  if(inRate===outRate) return buf;
+  const ratio=inRate/outRate, outLen=Math.floor(buf.length/ratio);
+  const out=new Float32Array(outLen); let pos=0;
+  for(let i=0;i<outLen;i++){ out[i]=buf[Math.floor(pos)]; pos+=ratio; }
+  return out;
+}
+
+/* =========================
+   DOM helpers
+========================= */
+const $ = id => document.getElementById(id);
+function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
+
+/* =========================
+   WebSocket lifecycle
+========================= */
+function attachWS(socket){
+  console.log("WS_URL =", WS_URL);
+  socket.onopen = ()=>{
+    setStatus("WebSocket connected ✔","ok");
+    wsRetry=0;
+    // keepalive (some proxies idle-drop)
+    pingTimer = setInterval(()=>{ 
+      if(socket.readyState===WebSocket.OPEN) {
+        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch {}
       }
-      if(off<out.length) out.fill(0,off);
+    }, 20000);
+  };
+  socket.onerror = (e)=>{ console.error("[WS] error", e); setStatus("WebSocket error","error"); };
+  socket.onclose = (e)=>{
+    console.warn("[WS] close", e.code, e.reason);
+    setStatus(`WebSocket closed (${e.code})`,"error");
+    if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+    // auto-reconnect if we were running
+    if (running) {
+      const backoff = Math.min(1000 * Math.pow(2, wsRetry++), 10000);
+      setTimeout(() => { connectWS(); }, backoff);
     }
-  }
-  function resampleLinear(f32,inR,outR){
-    if(inR===outR) return f32;
-    const ratio=outR/inR, out=new Float32Array(Math.floor(f32.length*ratio));
-    let pos=0;
-    for(let i=0;i<out.length;i++){
-      const idx=pos|0, frac=pos-idx, a=f32[idx]||0, b=f32[idx+1]||0;
-      out[i]=a+(b-a)*frac; pos+=1/ratio;
+  };
+  socket.onmessage = (evt)=>{
+    const m = JSON.parse(evt.data);
+    if(m.type==="partial"){ $('partial').textContent = m.text; }
+    if(m.type==="final"){
+      $('partial').textContent = "";
+      $('final').textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
     }
-    return out;
-  }
-  function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
-  function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
-  function downsample(buf,inRate,outRate=16000){
-    if(inRate===outRate) return buf;
-    const ratio=inRate/outRate, outLen=Math.floor(buf.length/ratio);
-    const out=new Float32Array(outLen); let pos=0;
-    for(let i=0;i<outLen;i++){ out[i]=buf[Math.floor(pos)]; pos+=ratio; }
-    return out;
-  }
+    // TTS
+    if(m.type==="tts_start"){
+      if(ttsPlayer) ttsPlayer.stop();
+      ttsPlayer = new PCMStreamer(m.sample_rate||24000);
+      ttsPlayer.ctx.resume();
+      setStatus("Speaking…","speak");
+    }
+    if(m.type==="tts_chunk" && ttsPlayer){ ttsPlayer.pushB64PCM16(m.pcm_b64); }
+    if(m.type==="tts_end"){ if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; } setStatus("Listening…","listen"); }
+    if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
+      if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
+      setStatus("Listening…","listen");
+    }
+  };
+}
+function connectWS(){
+  ws = new WebSocket(WS_URL);
+  attachWS(ws);
+}
 
-  // --- Helpers ---
-  const $ = (id)=>document.getElementById(id);
-  function setStatus(text, cls=""){
-    const el=$('status'); el.textContent=text; el.className="status "+cls;
-  }
+/* =========================
+   Mic → frames → WS
+========================= */
+async function start(){
+  if(running) return; running=true;
+  setStatus("Connecting…");
 
-  function attachWS(socket){
-    socket.onopen = ()=>{
-      setStatus("WebSocket connected ✔","ok");
-      pingTimer = setInterval(()=>{ 
-        if(socket.readyState===WebSocket.OPEN) socket.send(JSON.stringify({type:"ping"}));
-      },20000);
-    };
-    socket.onerror = ()=> setStatus("WebSocket error","error");
-    socket.onclose = (e)=>{
-      setStatus(`WebSocket closed (${e.code})`,"error");
-      if(pingTimer) clearInterval(pingTimer);
-    };
-    socket.onmessage = (evt)=>{
-      const m = JSON.parse(evt.data);
-      if(m.type==="partial"){ $('partial').textContent = m.text; }
-      if(m.type==="final"){
-        $('partial').textContent="";
-        $('final').textContent=`You: ${m.text}\nAssistant: ${m.reply}`;
-      }
-      if(m.type==="tts_start"){
-        if(ttsPlayer) ttsPlayer.stop();
-        ttsPlayer=new PCMStreamer(m.sample_rate||24000); ttsPlayer.ctx.resume();
-        setStatus("Speaking…","speak");
-      }
-      if(m.type==="tts_chunk" && ttsPlayer){ ttsPlayer.pushB64PCM16(m.pcm_b64); }
-      if(m.type==="tts_end"){ if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; } setStatus("Listening…","listen"); }
-      if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
-        if(ttsPlayer){ ttsPlayer.stop(); ttsPlayer=null; }
-        setStatus("Listening…","listen");
-      }
-    };
+  // 1) Ensure WS is open
+  connectWS();
+  try{
+    await new Promise((res,rej)=>{
+      if (ws.readyState===WebSocket.OPEN) return res();
+      const t=setTimeout(()=>{ cleanup(); rej(new Error("WS open timeout")); }, 10000);
+      const onOpen=()=>{ cleanup(); res(); };
+      const onErr =(e)=>{ cleanup(); rej(e); };
+      const onCls =(e)=>{ cleanup(); rej(e); };
+      function cleanup(){ clearTimeout(t); ws.removeEventListener('open',onOpen); ws.removeEventListener('error',onErr); ws.removeEventListener('close',onCls); }
+      ws.addEventListener('open',onOpen); ws.addEventListener('error',onErr); ws.addEventListener('close',onCls);
+    });
+  } catch (e) {
+    setStatus("WS failed to open","error"); running=false; return;
   }
 
-  async function start(){
-    if(running) return; running=true;
-    setStatus("Connecting…");
+  // 2) Get mic
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
 
-    ws = new WebSocket(WS_URL);
-    attachWS(ws);
+  // 3) AudioContext and capture
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
+  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); }catch{} }
 
-    try{ await new Promise((res,rej)=>{ ws.onopen=res; setTimeout(()=>rej("timeout"),8000); }); }
-    catch(e){ setStatus("WS failed to open","error"); running=false; return; }
+  const srcNode = audioCtx.createMediaStreamSource(stream);
 
-    try{ stream=await navigator.mediaDevices.getUserMedia({ audio:true }); }
-    catch(e){ setStatus("Mic permission denied","error"); running=false; return; }
+  // Use ScriptProcessorNode (simple + supported everywhere). Upgrade later to AudioWorklet if you like.
+  const proc = audioCtx.createScriptProcessor(1024,1,1);
+  proc.onaudioprocess = (e)=>{
+    if(!ws || ws.readyState!==WebSocket.OPEN) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const ds = downsample(input, audioCtx.sampleRate, 16000);
+    const i16 = f32ToI16(ds);
+    try {
+      ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) }));
+    } catch {}
+  };
+  srcNode.connect(proc); proc.connect(audioCtx.destination);
+  micNode = proc;
 
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
-    if(audioCtx.state==='suspended') await audioCtx.resume();
+  $('start').disabled = true; $('stop').disabled = false;
+  setStatus("Listening…","listen");
+}
 
-    const srcNode=audioCtx.createMediaStreamSource(stream);
-    const proc=audioCtx.createScriptProcessor(1024,1,1);
-    srcNode.connect(proc); proc.connect(audioCtx.destination);
-    proc.onaudioprocess=(e)=>{
-      if(ws.readyState!==WebSocket.OPEN) return;
-      const input=e.inputBuffer.getChannelData(0);
-      const ds=downsample(input,audioCtx.sampleRate,16000);
-      const i16=f32ToI16(ds);
-      ws.send(JSON.stringify({type:"audio",audio_b64:toB64(new Uint8Array(i16.buffer))}));
-    };
+function stop(){
+  running=false;
+  try{ ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"barge_in"})); }catch{}
+  try{ micNode && micNode.disconnect(); }catch{}
+  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
+  try{ audioCtx && audioCtx.close(); }catch{}
+  try{ ws && ws.close(); }catch{}
+  if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+  if (ttsPlayer) { ttsPlayer.stop(); ttsPlayer=null; }
+  $('start').disabled = false; $('stop').disabled = true;
+  setStatus("Stopped.");
+}
 
-    workletNode=proc;
-    setStatus("Listening…","listen");
-    $('start').disabled=true; $('stop').disabled=false;
-  }
+/* =========================
+   Quick WS echo test
+========================= */
+$('echo').onclick = ()=>{
+  const t = new WebSocket(ECHO_URL);
+  t.onopen  = ()=>console.log('[ECHO] open');
+  t.onerror = (e)=>console.error('[ECHO] error', e);
+  t.onclose = (e)=>console.warn('[ECHO] close', e.code, e.reason);
+  t.onmessage=(e)=>console.log('[ECHO] msg', e.data);
+  setTimeout(()=>{ try{ t.readyState===WebSocket.OPEN && t.send('hello'); }catch{} }, 500);
+};
 
-  function stop(){
-    running=false;
-    try{ ws.send(JSON.stringify({type:"barge_in"})); }catch{}
-    try{ workletNode.disconnect(); }catch{}
-    try{ stream.getTracks().forEach(t=>t.stop()); }catch{}
-    try{ audioCtx.close(); }catch{}
-    try{ ws.close(); }catch{}
-    if(ttsPlayer) ttsPlayer.stop();
-    $('start').disabled=false; $('stop').disabled=true;
-    setStatus("Stopped.");
-  }
+$('start').onclick = start;
+$('stop').onclick  = stop;
+window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch{} });
 
-  $('start').onclick=start;
-  $('stop').onclick=stop;
-  window.addEventListener('beforeunload', ()=>{ try{ws.close();}catch{} });
-  </script>
+</script>
 </body>
 </html>
