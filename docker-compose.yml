@@ -55,6 +55,14 @@ services:
 
   assistant:
     image: sithuyehtun/full_duplex_assistant:${IMAGE_TAG:-latest}
+
+    command: >
+      uvicorn assistant.app:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --forwarded-allow-ips="*"
+
     env_file:
       - ./src/assistant/.env
     environment:
@@ -83,7 +91,7 @@ services:
       - "traefik.http.routers.api.priority=50"
       - "traefik.http.routers.api.service=assistant-svc"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8000/"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/"]
       interval: 30s
       timeout: 5s
       retries: 3
