@@ -87,7 +87,13 @@ jobs:
               ls -la full_duplex_assistant_v1 || true
             fi
 
-            # pull the exact tag & run
+            echo ">>> Cleaning up old containers and images..."
+            docker stop $(docker ps -aq) || true
+            docker rm -f $(docker ps -aq) || true
+            docker rmi -f $(docker images -q) || true
+            docker system prune -af --volumes || true
+
+            echo ">>> Pulling new images and deploying..."
             docker-compose pull assistant
             docker-compose up -d --remove-orphans
 
