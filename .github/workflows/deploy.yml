@@ -78,7 +78,7 @@ jobs:
             EOF
 
             echo ">>> Write root .env"
-            cat > .env << 'EOF'
+            cat > .env << EOF
             LE_EMAIL=${{ secrets.LE_EMAIL }}
             IMAGE_TAG=${{ needs.build_push.outputs.tag }}
             EOF
@@ -96,15 +96,6 @@ jobs:
             echo ">>> Pull new images and start services"
             docker-compose pull
             docker-compose up -d --remove-orphans
-
-            echo ">>> Wait for Traefik to bind 443"
-            for i in {1..60}; do
-              if docker exec full_duplex_traefik_1 sh -lc 'ss -tlpn | grep -q ":443 "'; then
-                echo "Traefik is listening on 443"
-                break
-              fi
-              sleep 2
-            done
 
             echo ">>> Local HTTPS check (loopback with Host header)"
             for i in {1..60}; do
@@ -124,4 +115,4 @@ jobs:
               sleep 5
             done
 
-            echo "Deployed image tag: ${IMAGE_TAG}"
+            echo "Deployed image tag: ${{ needs.build_push.outputs.tag }}"
