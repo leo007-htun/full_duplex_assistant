@@ -276,12 +276,13 @@ async def mic_stream_vad():
 
 
 # =========================================================
-# TTS streaming to the browser
+# TTS streaming to the browser (with generation guard)
 # =========================================================
 class TTSSession:
     def __init__(self):
         self.task: Optional[asyncio.Task] = None
         self.cancel_event = asyncio.Event()
+        self.generation = 0  # invalidates in-flight PCM when incremented
 
     def cancel(self):
         self.cancel_event.set()
@@ -293,9 +294,11 @@ class TTSSession:
         self.cancel_event = asyncio.Event()
         self.task = None
 
-
 async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
+    """Stream TTS PCM to the browser; stop instantly if tts.cancel_event is set or generation changes."""
     SAMPLE_RATE = 24000
+    gen = tts.generation  # snapshot
+
     await ws.send_text(json.dumps({"type": "tts_start", "sample_rate": SAMPLE_RATE}))
 
     async def to_browser():
@@ -307,13 +310,15 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 response_format="pcm",
             ) as resp:
                 async for chunk in resp.iter_bytes():
-                    if tts.cancel_event.is_set():
+                    # bail out ASAP on cancel OR generation change
+                    if tts.cancel_event.is_set() or gen != tts.generation:
                         break
                     b64 = base64.b64encode(chunk).decode("utf-8")
                     await ws.send_text(json.dumps({"type": "tts_chunk", "pcm_b64": b64}))
         except asyncio.CancelledError:
             pass
         finally:
+            # Tell client the stream ended (client will resume 'Listening…')
             await ws.send_text(json.dumps({"type": "tts_end"}))
 
     async def to_server_speakers():
@@ -327,10 +332,7 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 input=text,
                 response_format="pcm",
             ) as resp:
-                if "cancel_event" in tts_player.play_pcm_stream.__code__.co_varnames:
-                    await tts_player.play_pcm_stream(resp, cancel_event=tts.cancel_event)
-                else:
-                    await tts_player.play_pcm_stream(resp)
+                await tts_player.play_pcm_stream(resp)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -420,9 +422,16 @@ async def ws_stream(ws: WebSocket):
                 if t == "ping":
                     status = "ok" if upstream_ref["conn"] else ("error" if connect_err["exc"] else "connecting")
                     await ws.send_text(json.dumps({"type": "pong", "t": time.time(), "upstream": status}))
+
                 elif t == "barge_in":
+                    # Immediate local stop + generation invalidate to drop late chunks
+                    tts.generation += 1
                     tts.cancel()
-                    await ws.send_text(json.dumps({"type": "tts_stop"}))
+                    try:
+                        await ws.send_text(json.dumps({"type": "tts_stop"}))
+                    except Exception:
+                        pass
+
                 elif t == "audio":
                     # ACK immediately so you see activity even without upstream
                     try:
@@ -438,9 +447,11 @@ async def ws_stream(ws: WebSocket):
                             "audio": data.get("audio_b64", ""),
                         }))
                     # With server VAD, do NOT commit per frame.
+
                 elif t == "flush":
                     if upstream_ref["conn"]:
                         await upstream_ref["conn"].send(json.dumps({"type": "input_audio_buffer.commit"}))
+
                 # ignore unknown types
         except WebSocketDisconnect:
             pass
@@ -472,6 +483,8 @@ async def ws_stream(ws: WebSocket):
                 continue
 
             if et == "input_audio_buffer.speech_started":
+                # Server VAD barge-in: stop TTS now and invalidate in-flight chunks
+                tts.generation += 1
                 tts.cancel()
                 await ws.send_text(json.dumps({"type": "tts_stop"}))
                 await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
@@ -486,8 +499,12 @@ async def ws_stream(ws: WebSocket):
                 user_text = evt.get("transcript", "")
                 res = await determine_intent(ChatMessage(message=user_text))
                 reply = res.get("result", "")
+
+                # Start a *new* TTS generation for this reply
+                tts.cancel()
+                tts.reset()
+                tts.generation += 1
                 await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
-                tts.cancel(); tts.reset()
                 tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
 
     # Run both loops; client_loop keeps the socket alive even if upstream fails
