@@ -24,9 +24,12 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(
 API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 RATE = 16000
-CHUNK = 1024
+CHUNK = 320  # 20ms @ 16kHz for the optional server mic loop
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
+
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-transcribe")
+OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 # =========================================================
 # FastAPI + CORS
@@ -110,7 +113,7 @@ async def determine_intent_gpt(message: str) -> Dict[str, str]:
 # (Optional) Web search via Playwright + summary
 # =========================================================
 async def bing_scrape(query: str):
-    from playwright.async_api import async_playwright  # lazy import (lighter startup)
+    from playwright.async_api import async_playwright  # lazy import
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -217,40 +220,31 @@ async def determine_intent(msg: ChatMessage):
 # Server-mic loop (local dev only)
 # =========================================================
 async def mic_stream_vad():
-    if not API_KEY:
+    """Optional: capture from server mic and stream to Realtime."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        print("mic_stream_vad: OPENAI_API_KEY not set; skipping server mic loop.")
         return
-    uri = "wss://api.openai.com/v1/realtime?intent=transcription"
+
     headers = [
-        ("Authorization", f"Bearer {API_KEY}"),
+        ("Authorization", f"Bearer {api_key}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
-    import pyaudio as _pa
 
-    async with websockets.connect(uri, extra_headers=headers) as upstream:
+    async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as upstream:
+        # Configure session
         await upstream.send(json.dumps({
-            "type": "transcription_session.update",
+            "type": "session.update",
             "session": {
-                # Option A: structured format
-                "input_audio_format": { "type": "pcm16", "sample_rate_hz": 16000 },
-        
-                # OR Option B: flat fields (if your SDK expects this)
-                # "input_audio_format": "pcm16",
-                # "sample_rate_hz": 16000,
-        
-                "input_audio_transcription": {
-                    "model": "gpt-4o-mini-transcribe",
-                    "language": "en"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.32,            # was 0.45
-                    "prefix_padding_ms": 300,     # was 150
-                    "silence_duration_ms": 350    # was 250
-                },
-                "input_audio_noise_reduction": { "type": "near_field" }
+                "input_audio_format": { "type": "pcm16", "sample_rate_hz": RATE },
+                "input_audio_transcription": { "model": OPENAI_REALTIME_MODEL, "language": "en" },
+                "turn_detection": { "type": "server_vad", "threshold": 0.32,
+                                    "prefix_padding_ms": 300, "silence_duration_ms": 350 },
+                "input_audio_noise_reduction": { "type": "near_field" },
             }
         }))
-        audio = _pa.PyAudio()
+
+        audio = pyaudio.PyAudio()
         stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
         async def send_audio():
@@ -259,7 +253,7 @@ async def mic_stream_vad():
                 audio_b64 = base64.b64encode(data).decode("utf-8")
                 await upstream.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
                 await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(CHUNK / RATE)  # ~20ms
 
         async def recv_transcription():
             buf: Dict[str, str] = {}
@@ -276,6 +270,8 @@ async def mic_stream_vad():
                     user_text = evt.get("transcript", "")
                     await determine_intent(ChatMessage(message=user_text))
                     buf.pop(evt.get("item_id"), None)
+                elif et in ("error", "response.error"):
+                    print("UPSTREAM ERROR (server mic):", json.dumps(evt, indent=2))
 
         await asyncio.gather(send_audio(), recv_transcription())
 
@@ -371,22 +367,28 @@ async def ws_stream(ws: WebSocket):
     await ws.accept()
     tts = TTSSession()
 
-    uri = "wss://api.openai.com/v1/realtime?intent=transcription"
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        await ws.send_text(json.dumps({"type": "error", "detail": "Missing OPENAI_API_KEY"}))
+        await ws.close()
+        return
+
     headers = [
-        ("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY', '')}"),
+        ("Authorization", f"Bearer {api_key}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
 
     try:
-        async with websockets.connect(uri, extra_headers=headers) as upstream:
+        async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as upstream:
+            # Configure session for browser mic stream
             await upstream.send(json.dumps({
-                "type": "transcription_session.update",
+                "type": "session.update",
                 "session": {
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
-                    "turn_detection": {"type": "server_vad", "threshold": 0.45,
-                                       "prefix_padding_ms": 150, "silence_duration_ms": 250},
-                    "input_audio_noise_reduction": {"type": "near_field"},
+                    "input_audio_format": { "type": "pcm16", "sample_rate_hz": 16000 },
+                    "input_audio_transcription": { "model": OPENAI_REALTIME_MODEL, "language": "en" },
+                    "turn_detection": { "type": "server_vad", "threshold": 0.32,
+                                        "prefix_padding_ms": 300, "silence_duration_ms": 350 },
+                    "input_audio_noise_reduction": { "type": "near_field" },
                 },
             }))
 
@@ -401,6 +403,7 @@ async def ws_stream(ws: WebSocket):
             async def forward_up():
                 try:
                     while True:
+                        # Expecting JSON text frames from browser
                         msg = await ws.receive_text()
                         try:
                             data = json.loads(msg)
@@ -419,6 +422,7 @@ async def ws_stream(ws: WebSocket):
                             continue
 
                         if t == "audio":
+                            # incoming: base64 PCM16 mono @16k
                             await upstream.send(json.dumps({
                                 "type": "input_audio_buffer.append",
                                 "audio": data.get("audio_b64", ""),
@@ -434,28 +438,36 @@ async def ws_stream(ws: WebSocket):
             async def forward_down():
                 async for raw in upstream:
                     evt = json.loads(raw)
-                    t = evt.get("type")
-            
-                    if t in ("error", "response.error"):
-                        print("upstream error:", evt)
-                    else:
-                        # Optional: brief heartbeat for visibility
-                        if t not in (
-                            "conversation.item.input_audio_transcription.delta",
-                            "input_audio_buffer.speech_started",
-                            "conversation.item.input_audio_transcription.completed",
-                        ):
-                            print("upstream evt:", t)
-            
-                    if t == "input_audio_buffer.speech_started":
+                    et = evt.get("type")
+
+                    if et in ("error", "response.error"):
+                        # Surface upstream errors to browser + server logs
+                        print("UPSTREAM ERROR:", json.dumps(evt, indent=2))
+                        try:
+                            await ws.send_text(json.dumps({"type": "error", "detail": evt}))
+                        except Exception:
+                            pass
+                        continue
+
+                    # Optional heartbeat to understand upstream flow
+                    if et not in (
+                        "conversation.item.input_audio_transcription.delta",
+                        "input_audio_buffer.speech_started",
+                        "conversation.item.input_audio_transcription.completed",
+                        "input_audio_buffer.committed",
+                        "input_audio_buffer.speech_stopped",
+                    ):
+                        print("upstream evt:", et)
+
+                    if et == "input_audio_buffer.speech_started":
                         tts.cancel()
                         await ws.send_text(json.dumps({"type": "tts_stop"}))
                         await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
-            
-                    elif t == "conversation.item.input_audio_transcription.delta":
+
+                    elif et in ("conversation.item.input_audio_transcription.delta", "transcription.delta"):
                         await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
-            
-                    elif t == "conversation.item.input_audio_transcription.completed":
+
+                    elif et in ("conversation.item.input_audio_transcription.completed", "transcription.completed"):
                         user_text = evt.get("transcript", "")
                         res = await determine_intent(ChatMessage(message=user_text))
                         reply = res.get("result", "")
@@ -463,7 +475,6 @@ async def ws_stream(ws: WebSocket):
                         tts.cancel()
                         tts.reset()
                         tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
-
 
             await asyncio.gather(ping(), forward_up(), forward_down())
 
