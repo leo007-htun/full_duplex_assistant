@@ -5,7 +5,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     super();
     this.outRate  = Math.floor(processorOptions.downsampleTo || 16000);
     this.frameMs  = Math.floor(processorOptions.postIntervalMs || 20);
-    this.frameLen = Math.floor(this.outRate * this.frameMs / 1000); // 320@20ms, 1600@100ms
+    this.frameLen = Math.floor(this.outRate * this.frameMs / 1000); // 320 @ 20ms
 
     // If the ratio is integer (48k→16k), use exact decimation
     this.decim = Math.round(sampleRate / this.outRate);
@@ -16,7 +16,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this.t = 0;        // accumulator (in "out samples" units)
     this.prev = 0;
 
-    // Small ring-ish buffer so we can carve fixed frames out
+    // Small buffer so we can carve fixed frames out
     this.buf = new Float32Array(this.frameLen * 4);
     this.bufLen = 0;
 
@@ -70,7 +70,6 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       let prev = this.prev;
       for (let i = 0; i < ch0.length; i++) {
         const curr = ch0[i];
-        // Accumulate "out samples" produced between prev->curr
         this.t += outRate;
         while (this.t >= inRate) {
           const frac = (this.t - inRate) / outRate;
