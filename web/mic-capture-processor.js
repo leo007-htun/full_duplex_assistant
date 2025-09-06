@@ -1,4 +1,3 @@
-// /mic-capture-processor-v2.js
 // Emits fixed-size Float32 frames at downsampleTo Hz.
 // Example: 48k -> 16k, 20ms -> 320 samples per post.
 class MicCaptureProcessorV2 extends AudioWorkletProcessor {
@@ -50,7 +49,7 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
       this.bufLen -= this.frameLen;
 
       // Post as transferable
-      this.port.postMessage({ type: 'audio', samples: chunk, rate: this.outRate }, [chunk.buffer]);
+      this.port.postMessage({ type: 'audio', samples: chunk, rate: this.outRate, frame_len: this.frameLen }, [chunk.buffer]);
     }
   }
 
