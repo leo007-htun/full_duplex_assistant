@@ -1,97 +1,161 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Browser Voice Assistant</title>
+  <meta charset="UTF-8">
+  <title>OpenAI Voice Assistant</title>
 </head>
 <body>
-<h1>Browser Voice Assistant</h1>
-<button id="startBtn">Start Listening</button>
-<p id="transcript"></p>
-<p id="response"></p>
+  <h1>OpenAI Voice Assistant (STT + TTS + VAD)</h1>
+  <button id="startBtn">Start Assistant</button>
+  <p><strong>Transcript:</strong> <span id="transcript"></span></p>
+  <p><strong>Response:</strong> <span id="response"></span></p>
 
-<script>
-let recognition;
-let isListening = false;
-let currentUtterance = null;
+<script type="module">
+import VAD from "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/index.js";
+
+let mediaRecorder;
+let audioChunks = [];
+let vad;
+let audioContext;
+let ttsAudio = null;
+
+// ⚠️ Replace with a backend that provides ephemeral OpenAI keys securely
+const OPENAI_API_KEY = "YOUR_API_KEY";  
+
+const transcriptEl = document.getElementById("transcript");
+const responseEl = document.getElementById("response");
 
 // --------------------
-// Speech Recognition Setup
+// Setup VAD
 // --------------------
-if (!('webkitSpeechRecognition' in window)) {
-    alert("Browser does not support SpeechRecognition API");
-} else {
-    recognition = new webkitSpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognition.onresult = (event) => {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
-        }
-        document.getElementById('transcript').innerText = transcript;
-
-        // When final speech is detected
-        if (event.results[event.results.length - 1].isFinal) {
-            stopTTS(); // make sure TTS is cut immediately
-
-            // Small delay to avoid overlap
-            setTimeout(() => {
-                sendToServer(transcript);
-            }, 150);
-        }
-    };
-
-    recognition.onend = () => {
-        if (isListening) recognition.start(); // auto-restart
-    };
+async function setupVAD(stream) {
+  vad = await VAD.MicVAD.new({
+    stream,
+    onSpeechStart: () => {
+      console.log("Speech detected, stopping TTS...");
+      stopTTS();
+    }
+  });
+  vad.start();
 }
 
-document.getElementById('startBtn').addEventListener('click', () => {
-    if (!isListening) {
-        recognition.start();
-        isListening = true;
-    } else {
-        recognition.stop();
-        isListening = false;
-    }
-});
+// --------------------
+// Speech Recording & Send to OpenAI
+// --------------------
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioContext = new AudioContext();
+
+  setupVAD(stream);
+
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = e => {
+    audioChunks.push(e.data);
+  };
+
+  mediaRecorder.onstop = async () => {
+    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+    audioChunks = [];
+    await sendToOpenAI(audioBlob);
+  };
+
+  mediaRecorder.start();
+  console.log("Recording started...");
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+    console.log("Recording stopped.");
+  }
+}
 
 // --------------------
-// TTS functions
+// OpenAI STT + Response
 // --------------------
-function playTTS(text) {
-    stopTTS(); // ensure no overlap
-    currentUtterance = new SpeechSynthesisUtterance(text);
-    window.speechSynthesis.speak(currentUtterance);
+async function sendToOpenAI(audioBlob) {
+  const formData = new FormData();
+  formData.append("file", audioBlob, "speech.webm");
+  formData.append("model", "gpt-4o-transcribe");
+
+  const sttResp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: formData
+  });
+
+  const sttData = await sttResp.json();
+  const userText = sttData.text;
+  transcriptEl.innerText = userText;
+
+  // Now send user text to GPT for intent/response
+  const chatResp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: userText }]
+    })
+  });
+
+  const chatData = await chatResp.json();
+  const reply = chatData.choices[0].message.content;
+  responseEl.innerText = reply;
+
+  // Play TTS
+  await playTTS(reply);
+}
+
+// --------------------
+// OpenAI TTS
+// --------------------
+async function playTTS(text) {
+  stopTTS(); // cancel any ongoing playback
+
+  const ttsResp = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
+      input: text
+    })
+  });
+
+  const arrayBuffer = await ttsResp.arrayBuffer();
+  const audioBlob = new Blob([arrayBuffer], { type: "audio/mp3" });
+  const audioUrl = URL.createObjectURL(audioBlob);
+  ttsAudio = new Audio(audioUrl);
+  ttsAudio.play();
 }
 
 function stopTTS() {
-    if (speechSynthesis.speaking || speechSynthesis.pending) {
-        window.speechSynthesis.cancel(); // force stop
-    }
-    currentUtterance = null;
+  if (ttsAudio) {
+    ttsAudio.pause();
+    ttsAudio.src = "";
+    ttsAudio = null;
+    console.log("TTS stopped.");
+  }
 }
 
 // --------------------
-// Send transcript to FastAPI
+// Button Control
 // --------------------
-async function sendToServer(text) {
-    try {
-        const resp = await fetch("https://com-cloud.cloud/api/determine_intent", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({message: text})
-        });
-        const data = await resp.json();
-        document.getElementById('response').innerText = data.result;
-        playTTS(data.result);
-    } catch (err) {
-        console.error("Error sending to server:", err);
-    }
-}
+document.getElementById("startBtn").addEventListener("click", () => {
+  if (!mediaRecorder || mediaRecorder.state === "inactive") {
+    startRecording();
+  } else {
+    stopRecording();
+  }
+});
 </script>
 </body>
 </html>
