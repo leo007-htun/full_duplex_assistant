@@ -48,12 +48,10 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
   _postFramesIfReady() {
     while (this.bufLen >= this.frameLen) {
       const chunk = new Float32Array(this.frameLen);
-      // copy out first frameLen
       chunk.set(this.buf.subarray(0, this.frameLen));
-      // shift remainder down
       this.buf.copyWithin(0, this.frameLen, this.bufLen);
       this.bufLen -= this.frameLen;
-      // Post as transferable to avoid copies
+
       this.port.postMessage(
         { type: 'audio', samples: chunk, rate: this.outRate, frame_len: this.frameLen },
         [chunk.buffer]
@@ -65,17 +63,14 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
     const input = inputs && inputs[0];
     if (!input || input.length === 0) return true;
 
-    // Take first channel (or mix to mono if multiple)
     let ch = input[0];
     if (!ch || ch.length === 0) return true;
 
-    // If more than one channel, very light mono mix (L only is fine too)
+    // If more than one channel, quick mono average into L
     if (input.length > 1) {
       const L = input[0], R = input[1];
       const N = Math.min(L.length, R ? R.length : 0);
       if (N > 0) {
-        // quick in-place-ish average into L (saves an alloc)
-        // falls back to L if R missing/short
         for (let i = 0; i < N; i++) L[i] = 0.5 * (L[i] + (R ? R[i] : 0));
         ch = L;
       }
@@ -86,12 +81,10 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
       for (let i = 0; i < ch.length; i++) {
         if (this.phase === 0) this._pushSample(ch[i]);
         this.phase++;
-        if (this.phase >= this.decim) this.phase = 0; // avoid unbounded growth
+        if (this.phase >= this.decim) this.phase = 0; // prevent overflow
       }
     } else {
       // Generic linear resampler (44.1k -> 16k, etc.)
-      // Accumulate "outRate" ticks per input sample; emit whenever >= inRate.
-      // Interpolate between prev and curr at fractional position.
       const inRate  = sampleRate;
       const outRate = this.outRate;
       let prev = this.prev;
@@ -101,7 +94,6 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
         this.accum += outRate;
 
         while (this.accum >= inRate) {
-          // fraction along [prev -> curr] where the output falls within this input step
           const frac = (this.accum - inRate) / outRate; // in [0, 1)
           const y = prev + (curr - prev) * frac;
           this._pushSample(y);
