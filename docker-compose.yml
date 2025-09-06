@@ -64,6 +64,7 @@ services:
     environment:
       - ENABLE_VOICE=0
       - ALLOWED_ORIGINS=https://com-cloud.cloud
+      - OPENAI_REALTIME_MODEL=gpt-realtime
     expose:
       - "8000"
     labels:
