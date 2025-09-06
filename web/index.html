@@ -54,14 +54,13 @@ let micNode=null, micSink=null;
 
 // ==== TTS (AudioWorklet) ====
 let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
-let ttsPlaying=false;           // are we currently talking?
-let ttsBarged=false;            // have we sent barge_in during this speech burst?
 
 /* =========================
    Helpers
 ========================= */
 const $ = id => document.getElementById(id);
 const log = (...a)=>{ try{ console.log(...a); }catch(e){}; const el=$('log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
+
 function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
 
 // base64 PCM16LE -> Float32 [-1,1]
@@ -101,27 +100,34 @@ function rms(samples){ let s=0; for(let i=0;i<samples.length;i++){ const v=sampl
 async function ensureTTSContext(sampleRateHint=24000){
   if (ttsCtx && ttsNode) return;
   ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
-  await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // make sure this file is served
+  try {
+    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js');
+  } catch (e) {
+    console.error('Failed to load /pcm-player-processor.js', e);
+    setStatus('Failed to load TTS worklet','error');
+    throw e;
+  }
   ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
   ttsNode.connect(ttsCtx.destination);
 }
 function ttsFlush(){
-  try { ttsNode?.port?.postMessage({ type: 'flush' }); } catch {}
+  try {
+    if (ttsNode && ttsNode.port) ttsNode.port.postMessage({ type: 'flush' });
+  } catch (e) {}
 }
-function ttsStopLocal(){
-  // Instant local stop
-  ttsFlush();
-  try { if (ttsCtx?.state === 'running') ttsCtx.suspend(); } catch {}
-  ttsPlaying=false;
+function ttsStop(){
+  try { if (ttsNode) ttsNode.disconnect(); } catch (e) {}
+  try { if (ttsCtx) ttsCtx.close(); } catch (e) {}
+  ttsNode=null; ttsCtx=null;
 }
 
 /* =========================
-   Partial/final + VAD
+   Partial/final logic + VAD fallbacks
 ========================= */
-const VAD_THRESHOLD     = 0.012;  // raise to 0.015–0.02 if noisy
-const VAD_SILENCE_MS    = 700;
-const FINAL_FALLBACK_MS = 1400;
-const NO_VAD_MAX_MS     = 1800;
+const VAD_THRESHOLD     = 0.012;  // adjust 0.008–0.02 for room noise
+const VAD_SILENCE_MS    = 700;    // flush after this much silence
+const FINAL_FALLBACK_MS = 1400;   // if no 'final' after last partial
+const NO_VAD_MAX_MS     = 1800;   // speech energy but no partials → flush
 
 let partialBuf = "";
 let lastPartialAt = 0;
@@ -143,7 +149,7 @@ function attachWS(socket){
     wsRetry=0;
     pingTimer = setInterval(()=>{
       if(socket.readyState===WebSocket.OPEN) {
-        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch {}
+        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch (e) {}
       }
     }, 20000);
   };
@@ -160,60 +166,57 @@ function attachWS(socket){
   socket.onmessage = async (evt)=>{
     const m = JSON.parse(evt.data);
 
+    // debug/ack/error/status
     if (m.type === "ack") log("ACK:", m.kind, m.bytes+"B");
     if (m.type === "error") log("UPSTREAM ERROR:", JSON.stringify(m.detail));
     if (m.type === "status") log("Upstream:", m.upstream);
 
+    // ---- speech lifecycle events ----
     if (m.type === "event" && m.name === "speech_started") {
-      // server VAD started — also stop TTS locally (belt & suspenders)
-      ttsStopLocal();
-      ttsBarged = true; // we've already barged this turn
+      partialBuf = "";
+      $('partial').textContent = "";
+      if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
+      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
     }
 
+    // ---- accumulate partials (append, don't overwrite) ----
     if (m.type === "partial") {
       partialBuf += m.text || "";
       $('partial').textContent = partialBuf;
       lastPartialAt = performance.now();
+      // auto-finalize if no final soon
       if (finalFallbackTimer) clearTimeout(finalFallbackTimer);
       finalFallbackTimer = setTimeout(()=>{
-        try { ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"flush"})); } catch {}
+        try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
       }, FINAL_FALLBACK_MS);
     }
 
+    // ---- final ----
     if (m.type === "final") {
       $('partial').textContent = "";
       const you = m.text && m.text.length ? m.text : partialBuf;
       $('final').textContent = "You: " + (you || "") + "\nAssistant: " + (m.reply || "");
       partialBuf = "";
       if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
-      if (noVadTimer)        { clearTimeout(noVadTimer);        noVadTimer=null; }
+      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
       setStatus("Listening…","listen");
-      // allow TTS again next turn
-      ttsBarged = false;
     }
 
     // ====== TTS handling ======
     if(m.type==="tts_start"){
       ttsSrcRate = m.sample_rate || 24000;
       await ensureTTSContext(ttsSrcRate);
-      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch {} }
-      ttsPlaying=true;
+      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch (e) {} }
       setStatus("Speaking…","speak");
     }
     if(m.type==="tts_chunk" && ttsNode){
-      // low-latency: push chunks as they arrive
       const f32src = base64ToFloat32(m.pcm_b64);
       const f32out = resampleLinear(f32src, ttsSrcRate, ttsCtx.sampleRate);
       ttsNode.port.postMessage({ type: 'audio', samples: f32out }, [f32out.buffer]);
     }
-    if(m.type==="tts_end"){
-      ttsPlaying=false;
-      ttsFlush();
-      setStatus("Listening…","listen");
-    }
+    if(m.type==="tts_end"){ ttsFlush(); setStatus("Listening…","listen"); }
     if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
-      ttsStopLocal();
-      setStatus("Listening…","listen");
+      ttsFlush(); setStatus("Listening…","listen");
     }
   };
 }
@@ -226,6 +229,7 @@ async function start(){
   if(running) return; running=true;
   setStatus("Connecting…");
 
+  // 1) Ensure WS is open
   connectWS();
   try{
     await new Promise((res,rej)=>{
@@ -237,25 +241,36 @@ async function start(){
       function cleanup(){ clearTimeout(t); ws.removeEventListener('open',onOpen); ws.removeEventListener('error',onErr); ws.removeEventListener('close',onCls); }
       ws.addEventListener('open',onOpen); ws.addEventListener('error',onErr); ws.addEventListener('close',onCls);
     });
-  } catch (e) { setStatus("WS failed to open","error"); running=false; return; }
+  } catch (e) {
+    setStatus("WS failed to open","error"); running=false; return;
+  }
 
-  // 2) Mic permission
+  // 2) Mic permission (mono + noise controls help VAD)
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     });
     log('Mic stream granted');
-  } catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
+  }
+  catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
 
-  // 3) AudioContext + Worklet
+  // 3) AudioContext and mic capture via Worklet
   audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
   log('AudioContext rate =', audioCtx.sampleRate);
-  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch {} }
+  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch (e) {} }
+
   try {
+    // use versioned v2 worklet (avoids caching old code)
     await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
   } catch (e) {
     console.error('Failed to load /mic-capture-processor.js', e);
-    setStatus('Failed to load mic worklet','error'); running=false; return;
+    setStatus('Failed to load mic worklet','error');
+    running=false; return;
   }
 
   const srcNode = audioCtx.createMediaStreamSource(stream);
@@ -263,7 +278,7 @@ async function start(){
     numberOfInputs: 1,
     numberOfOutputs: 1,
     outputChannelCount: [1],
-    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 } // 20ms -> 320 samples
+    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 } // 20ms -> 320 samples @16k
   });
 
   let framesSent = 0;
@@ -271,29 +286,28 @@ async function start(){
   micNodeLocal.port.onmessage = (e)=>{
     const { type, samples, rate, frame_len } = e.data || {};
 
-    if (type === 'debug') { if (rate) log('Worklet rate =', rate, 'frame_len =', frame_len); return; }
+    if (type === 'debug') {
+      if (rate) log('Worklet rate =', rate, 'frame_len =', frame_len);
+      return;
+    }
 
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
+      // level + meter
       const level = rms(samples);
       setMeter(level * 1.8);
 
-      // ---- Local barge-in: STOP TTS *immediately* when you start talking
-      if (level > VAD_THRESHOLD && ttsPlaying && !ttsBarged) {
-        ttsStopLocal();                  // kill local playback now
-        try { ws.send(JSON.stringify({ type: "barge_in" })); } catch {}
-        ttsBarged = true;
-      }
-
-      // ---- Client-side silence → force finalize (for reliability)
+      // --- silence/speech tracking ---
       const now = performance.now();
       const dt  = Math.max(0, now - lastFrameT);
       lastFrameT = now;
 
       if (level > VAD_THRESHOLD) {
+        // speech detected
         if (!wasSpeaking) {
+          // just started: arm a "no-VAD" fallback timer
           if (noVadTimer) clearTimeout(noVadTimer);
           noVadTimer = setTimeout(()=>{
-            try { ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"flush"})); } catch {}
+            try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
           }, NO_VAD_MAX_MS);
         }
         wasSpeaking = true;
@@ -302,27 +316,31 @@ async function start(){
       } else if (wasSpeaking) {
         silenceMs += dt;
         if (silenceMs >= VAD_SILENCE_MS) {
-          try { ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"flush"})); } catch {}
+          // quiet long enough → ask server to finalize
+          try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
           wasSpeaking = false;
           silenceMs = 0;
         }
       }
 
-      // --- send audio frame ---
+      // --- send the audio frame ---
       const i16 = f32ToI16(samples);
       try {
         ws.send(JSON.stringify({
           type: "audio",
           sr: 16000,
           channels: 1,
-          frame_samples: samples.length,
+          frame_samples: samples.length, // should be 320
           audio_b64: toB64(new Uint8Array(i16.buffer))
         }));
         if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
-      } catch (err) { console.error('WS send failed', err); }
+      } catch (err) {
+        console.error('WS send failed', err);
+      }
     }
   };
 
+  // keep node in the graph but muted (prevents Chrome GC)
   micSink = audioCtx.createGain(); micSink.gain.value = 0;
   srcNode.connect(micNodeLocal); micNodeLocal.connect(micSink); micSink.connect(audioCtx.destination);
 
@@ -335,27 +353,27 @@ async function start(){
 async function stop(){
   running=false;
 
-  // finalize anything pending + stop TTS
-  try { ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"flush"})); } catch {}
-  try { ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"barge_in"})); } catch {}
-  ttsStopLocal();
+  // finalize anything pending
+  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
+  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); } catch (e) {}
 
-  // small window for 'final' to land
-  try { await new Promise(r => setTimeout(r, 200)); } catch {}
+  // give a brief window for 'final' to arrive
+  try { await new Promise(r => setTimeout(r, 200)); } catch (e) {}
 
-  try{ micNode && micNode.disconnect(); }catch{}
-  try{ micSink && micSink.disconnect(); }catch{}
-  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
-  try{ audioCtx && audioCtx.close(); }catch{}
-  try{ ws && ws.close(); }catch{}
+  try{ if (micNode) micNode.disconnect(); }catch(e){}
+  try{ if (micSink) micSink.disconnect(); }catch(e){}
+  try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  try{ if (audioCtx) audioCtx.close(); }catch(e){}
+  try{ if (ws) ws.close(); }catch(e){}
   if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+  ttsStop();
   micNode=null; micSink=null; stream=null; audioCtx=null;
   $('start').disabled = false; $('stop').disabled = true;
   setStatus("Stopped.");
 }
 
 /* =========================
-   Echo + controls
+   Quick WS echo test
 ========================= */
 $('echo').onclick = ()=>{
   const t = new WebSocket(ECHO_URL);
@@ -363,12 +381,14 @@ $('echo').onclick = ()=>{
   t.onerror = (e)=>console.error('[ECHO] error', e);
   t.onclose = (e)=>console.warn('[ECHO] close', e.code, e.reason);
   t.onmessage=(e)=>console.log('[ECHO] msg', e.data);
-  setTimeout(()=>{ try{ t.readyState===WebSocket.OPEN && t.send('hello'); }catch{} }, 500);
+  setTimeout(()=>{ try{ if (t.readyState===WebSocket.OPEN) t.send('hello'); }catch(e){} }, 500);
 };
-$('force').onclick = ()=>{ try{ ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:'flush'})); }catch{} };
+
+$('force').onclick = ()=>{ try{ if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'flush'})); }catch(e){} };
+
 $('start').onclick = start;
 $('stop').onclick  = stop;
-window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch{} });
+window.addEventListener('beforeunload', ()=>{ try{ if (ws) ws.close(); }catch(e){} });
 </script>
 </body>
 </html>
