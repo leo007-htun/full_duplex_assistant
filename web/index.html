@@ -26,6 +26,7 @@
   <div>
     <button id="start">🎙️ Start</button>
     <button id="stop"  disabled>⏹️ Stop</button>
+    <button id="force" title="Force commit current turn" class="muted">🚀 Force Send</button>
     <button id="echo"  class="muted" title="Quick WS routing test">🔎 Test Echo</button>
   </div>
 
@@ -58,7 +59,7 @@ let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
    Helpers
 ========================= */
 const $ = id => document.getElementById(id);
-const log = (...a)=>{ console.log(...a); $('log').textContent += a.join(' ') + '\n'; };
+const log = (...a)=>{ try{ console.log(...a); }catch(e){}; const el=$('log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
 
 function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
 
@@ -89,7 +90,7 @@ function resampleLinear(f32, srcRate, dstRate){
   return out;
 }
 function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
-function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0?s*0x8000:s*0x7FFF; } return o; }
+function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0? Math.round(s*0x8000) : Math.round(s*0x7FFF); } return o; }
 function setMeter(level01){ $('bar').style.width = Math.min(1,Math.max(0,level01))*220 + 'px'; }
 function rms(samples){ let s=0; for(let i=0;i<samples.length;i++){ const v=samples[i]; s+=v*v; } return Math.sqrt(s/Math.max(1,samples.length)); }
 
@@ -121,6 +122,24 @@ function ttsStop(){
 }
 
 /* =========================
+   Partial/final logic + VAD fallbacks
+========================= */
+const VAD_THRESHOLD     = 0.012;  // adjust 0.008–0.02 for room noise
+const VAD_SILENCE_MS    = 700;    // flush after this much silence
+const FINAL_FALLBACK_MS = 1400;   // if no 'final' after last partial
+const NO_VAD_MAX_MS     = 1800;   // speech energy but no partials → flush
+
+let partialBuf = "";
+let lastPartialAt = 0;
+let lastEnergyAt  = 0;
+
+let finalFallbackTimer = null;
+let noVadTimer        = null;
+let wasSpeaking       = false;
+let silenceMs         = 0;
+let lastFrameT        = performance.now();
+
+/* =========================
    WebSocket lifecycle
 ========================= */
 function attachWS(socket){
@@ -147,10 +166,40 @@ function attachWS(socket){
   socket.onmessage = async (evt)=>{
     const m = JSON.parse(evt.data);
 
-    if(m.type==="partial"){ $('partial').textContent = m.text; }
-    if(m.type==="final"){
+    // debug/ack/error/status
+    if (m.type === "ack") log("ACK:", m.kind, m.bytes+"B");
+    if (m.type === "error") log("UPSTREAM ERROR:", JSON.stringify(m.detail));
+    if (m.type === "status") log("Upstream:", m.upstream);
+
+    // ---- speech lifecycle events ----
+    if (m.type === "event" && m.name === "speech_started") {
+      partialBuf = "";
       $('partial').textContent = "";
-      $('final').textContent = "You: " + m.text + "\nAssistant: " + m.reply;
+      if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
+      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
+    }
+
+    // ---- accumulate partials (append, don't overwrite) ----
+    if (m.type === "partial") {
+      partialBuf += m.text || "";
+      $('partial').textContent = partialBuf;
+      lastPartialAt = performance.now();
+      // auto-finalize if no final soon
+      if (finalFallbackTimer) clearTimeout(finalFallbackTimer);
+      finalFallbackTimer = setTimeout(()=>{
+        try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
+      }, FINAL_FALLBACK_MS);
+    }
+
+    // ---- final ----
+    if (m.type === "final") {
+      $('partial').textContent = "";
+      const you = m.text && m.text.length ? m.text : partialBuf;
+      $('final').textContent = "You: " + (you || "") + "\nAssistant: " + (m.reply || "");
+      partialBuf = "";
+      if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
+      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
+      setStatus("Listening…","listen");
     }
 
     // ====== TTS handling ======
@@ -216,10 +265,10 @@ async function start(){
   if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch (e) {} }
 
   try {
-    //await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
+    // use versioned v2 worklet (avoids caching old code)
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor-v2.js?v=2');
   } catch (e) {
-    console.error('Failed to load /mic-capture-processor.js', e);
+    console.error('Failed to load /mic-capture-processor-v2.js', e);
     setStatus('Failed to load mic worklet','error');
     running=false; return;
   }
@@ -235,16 +284,46 @@ async function start(){
   let framesSent = 0;
 
   micNodeLocal.port.onmessage = (e)=>{
-    const { type, samples, rate } = e.data || {};
+    const { type, samples, rate, frame_len } = e.data || {};
 
-    // optional debug message from worklet
-    //if (type === 'debug' && rate) { log('Worklet rate =', rate); return; }
-    if (type === 'debug') { log('Worklet rate =', rate, 'frame_len =', e.data.frame_len); return; }
+    if (type === 'debug') {
+      if (rate) log('Worklet rate =', rate, 'frame_len =', frame_len);
+      return;
+    }
 
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
-      // live meter for confidence
-      setMeter(rms(samples) * 1.8);
+      // level + meter
+      const level = rms(samples);
+      setMeter(level * 1.8);
 
+      // --- silence/speech tracking ---
+      const now = performance.now();
+      const dt  = Math.max(0, now - lastFrameT);
+      lastFrameT = now;
+
+      if (level > VAD_THRESHOLD) {
+        // speech detected
+        if (!wasSpeaking) {
+          // just started: arm a "no-VAD" fallback timer
+          if (noVadTimer) clearTimeout(noVadTimer);
+          noVadTimer = setTimeout(()=>{
+            try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
+          }, NO_VAD_MAX_MS);
+        }
+        wasSpeaking = true;
+        silenceMs = 0;
+        lastEnergyAt = now;
+      } else if (wasSpeaking) {
+        silenceMs += dt;
+        if (silenceMs >= VAD_SILENCE_MS) {
+          // quiet long enough → ask server to finalize
+          try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
+          wasSpeaking = false;
+          silenceMs = 0;
+        }
+      }
+
+      // --- send the audio frame ---
       const i16 = f32ToI16(samples);
       try {
         ws.send(JSON.stringify({
@@ -271,9 +350,16 @@ async function start(){
   setStatus("Listening…","listen");
 }
 
-function stop(){
+async function stop(){
   running=false;
-  try{ if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); }catch(e){}
+
+  // finalize anything pending
+  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
+  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); } catch (e) {}
+
+  // give a brief window for 'final' to arrive
+  try { await new Promise(r => setTimeout(r, 200)); } catch (e) {}
+
   try{ if (micNode) micNode.disconnect(); }catch(e){}
   try{ if (micSink) micSink.disconnect(); }catch(e){}
   try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch(e){}
@@ -297,6 +383,8 @@ $('echo').onclick = ()=>{
   t.onmessage=(e)=>console.log('[ECHO] msg', e.data);
   setTimeout(()=>{ try{ if (t.readyState===WebSocket.OPEN) t.send('hello'); }catch(e){} }, 500);
 };
+
+$('force').onclick = ()=>{ try{ if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'flush'})); }catch(e){} };
 
 $('start').onclick = start;
 $('stop').onclick  = stop;
