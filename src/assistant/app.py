@@ -1,23 +1,18 @@
 import asyncio
-import base64
 import json
 import os
-from typing import Optional, Dict, List
+from typing import Dict, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .services.openai_client import client
-from .voice.tts_player import StreamingTTSPlayer
 
-# =========================================================
-# Config
-# =========================================================
-ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
+API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-app = FastAPI(title="Voice Assistant")
+app = FastAPI(title="Browser-First Voice Assistant")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -26,132 +21,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-tts_player = StreamingTTSPlayer()
-
-# =========================================================
-# Conversation
-# =========================================================
 conversation_history: List[Dict[str, str]] = []
 
-# =========================================================
-# HTTP Routes
-# =========================================================
+# -------------------
+# Prompts
+# -------------------
+from jinja2 import Environment, FileSystemLoader
+PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
+_env = Environment(loader=FileSystemLoader(PROMPT_DIR))
+
+
+def render_intent_prompt() -> str:
+    return _env.get_template("intent_prompt.j2").render()
+
+
+def render_system_prompt(session_id: str = "SESSION-001") -> str:
+    return _env.get_template("system_prompt.j2").render(session_id=session_id)
+
+
 class ChatMessage(BaseModel):
     message: str
+
+
+# -------------------
+# Determine intent
+# -------------------
+async def determine_intent_gpt(message: str) -> Dict[str, str]:
+    prompt = render_intent_prompt()
+    resp = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": message},
+        ],
+        temperature=0.2,
+        stream=False,
+    )
+    try:
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        return {"intent": "unknown", "reason": "Could not parse GPT response."}
+
 
 @app.post("/determine_intent")
 async def determine_intent(msg: ChatMessage):
     global conversation_history
     user_text = msg.message
+    intent_data = await determine_intent_gpt(user_text)
+    intent = intent_data.get("intent", "unknown")
 
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":user_text}],
-        temperature=0.7,
-        stream=False
-    )
-    reply = resp.choices[0].message.content.strip()
-    conversation_history.append({"role":"user","content":user_text})
-    conversation_history.append({"role":"assistant","content":reply})
-    if len(conversation_history) > 40:
-        conversation_history = conversation_history[-40:]
-    
-    if ENABLE_VOICE:
-        # optional server TTS
-        await speak_tts(reply)
-    
-    return {"result": reply}
+    # Simple smalltalk logic
+    if intent == "smalltalk":
+        system_content = render_system_prompt()
+        history = [{"role": "system", "content": system_content}] + conversation_history
+        history.append({"role": "user", "content": user_text})
+        chat_resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=history,
+            temperature=0.7,
+            stream=False,
+        )
+        result = chat_resp.choices[0].message.content.strip()
+        conversation_history += [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": result},
+        ]
+        if len(conversation_history) > 40:
+            conversation_history = conversation_history[-40:]
+    else:
+        result = f"Intent: {intent}, GPT reply: {intent_data.get('response','')}"
 
-async def speak_tts(text: str):
-    if not ENABLE_VOICE or not text:
-        return
-    try:
-        tts_player.stop()
-        async with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice="nova",
-            input=text,
-            response_format="pcm"
-        ) as resp:
-            await tts_player.play_pcm_stream(resp)
-    except Exception:
-        pass
-
-# =========================================================
-# WebSocket for real-time STT+TTS
-# =========================================================
-class TTSSession:
-    def __init__(self):
-        self.task: Optional[asyncio.Task] = None
-        self.cancel_event = asyncio.Event()
-
-    def cancel(self):
-        self.cancel_event.set()
-        tts_player.stop()
-        if self.task and not self.task.done():
-            self.task.cancel()
-
-    def reset(self):
-        self.cancel_event = asyncio.Event()
-        self.task = None
-
-async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
-    """Stream TTS PCM to browser; interruptable."""
-    await ws.send_text(json.dumps({"type":"tts_start", "sample_rate":24000}))
-    try:
-        async with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice="nova",
-            input=text,
-            response_format="pcm"
-        ) as resp:
-            async for chunk in resp.iter_bytes():
-                if tts.cancel_event.is_set():
-                    break
-                await ws.send_text(json.dumps({"type":"tts_chunk", "pcm_b64":base64.b64encode(chunk).decode()}))
-    finally:
-        await ws.send_text(json.dumps({"type":"tts_end"}))
-
-@app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket):
-    await ws.accept()
-    tts = TTSSession()
-
-    try:
-        while True:
-            msg = await ws.receive_text()
-            try:
-                data = json.loads(msg)
-            except Exception:
-                continue
-
-            t = data.get("type")
-            if t == "ping":
-                await ws.send_text(json.dumps({"type":"pong"}))
-            elif t == "barge_in":
-                tts.cancel()
-                await ws.send_text(json.dumps({"type":"tts_stop"}))
-            elif t == "audio":
-                # Send to OpenAI Realtime API for transcription
-                async with websockets.connect(
-                    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-transcribe",
-                    extra_headers=[("Authorization", f"Bearer {os.getenv('OPENAI_API_KEY','')}"),
-                                   ("OpenAI-Beta","realtime=v1")]
-                ) as upstream:
-                    await upstream.send(json.dumps({
-                        "type":"input_audio_buffer.append",
-                        "audio":data.get("audio_b64","")
-                    }))
-                    await upstream.send(json.dumps({"type":"input_audio_buffer.commit"}))
-            elif t == "flush":
-                pass  # optional commit flush logic
-
-    except WebSocketDisconnect:
-        tts.cancel()
-
-# =========================================================
-# Startup
-# =========================================================
-@app.on_event("startup")
-async def startup_event():
-    print("✅ Voice Assistant started. Browser mic mode active.")
+    return {"intent": intent, "result": result}
