@@ -42,7 +42,8 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
       # Optional: explicitly exclude /api from the static site
-      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`) && !PathPrefix(`/ws`) && !PathPrefix(`/ws/`) && !PathPrefix(`/api`)"
+      #- "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && PathPrefix(`/`) && !PathPrefix(`/ws`) && !PathPrefix(`/ws/`) && !PathPrefix(`/api`)"
+      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`)
       - "traefik.http.routers.web.entrypoints=websecure"
       - "traefik.http.routers.web.tls=true"
       - "traefik.http.routers.web.tls.certresolver=letsencrypt"
