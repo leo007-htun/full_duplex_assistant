@@ -220,7 +220,7 @@ async function start(){
     numberOfInputs: 1,
     numberOfOutputs: 1,
     outputChannelCount: [1],
-    processorOptions: { downsampleTo: 16000, postIntervalMs: 100 }
+    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 }
   });
 
   let framesSent = 0;
@@ -236,8 +236,14 @@ async function start(){
       setMeter(rms(samples) * 1.8);
 
       const i16 = f32ToI16(samples);
-      try { 
-        ws.send(JSON.stringify({ type:"audio", audio_b64: toB64(new Uint8Array(i16.buffer)) })); 
+ 
+      ws.send(JSON.stringify({ 
+        type:"audio",
+        sr:16000,
+        channels:1,
+        frame_samples: samples.length,
+        audio_b64: toB64(new Uint8Array(i16.buffer)) 
+      })); 
         if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
       } catch (err) {
         console.error('WS send failed', err);
