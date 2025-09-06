@@ -24,7 +24,7 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(
 API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 RATE = 16000
-CHUNK = 320  # 20ms @ 16kHz for the optional server mic loop
+CHUNK = 320  # 20ms @ 16kHz for server mic (if used)
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
@@ -82,7 +82,6 @@ async def speak_tts(text: str):
             input=text,
             response_format="pcm",
         ) as response:
-            # play until done
             await tts_player.play_pcm_stream(response)
     except Exception:
         # don't let TTS failure break the request
@@ -220,7 +219,7 @@ async def determine_intent(msg: ChatMessage):
 # Server-mic loop (local dev only)
 # =========================================================
 async def mic_stream_vad():
-    """Optional: capture from server mic and stream to Realtime."""
+    """Optional: capture from server mic and stream to Realtime (server VAD; no per-frame commit)."""
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         print("mic_stream_vad: OPENAI_API_KEY not set; skipping server mic loop.")
@@ -236,11 +235,11 @@ async def mic_stream_vad():
         await upstream.send(json.dumps({
             "type": "session.update",
             "session": {
-                "input_audio_format": { "type": "pcm16", "sample_rate_hz": RATE },
-                "input_audio_transcription": { "model": OPENAI_REALTIME_MODEL, "language": "en" },
-                "turn_detection": { "type": "server_vad", "threshold": 0.32,
-                                    "prefix_padding_ms": 300, "silence_duration_ms": 350 },
-                "input_audio_noise_reduction": { "type": "near_field" },
+                "input_audio_format": {"type": "pcm16", "sample_rate_hz": RATE},
+                "input_audio_transcription": {"model": OPENAI_REALTIME_MODEL, "language": "en"},
+                "turn_detection": {"type": "server_vad", "threshold": 0.32,
+                                   "prefix_padding_ms": 300, "silence_duration_ms": 350},
+                "input_audio_noise_reduction": {"type": "near_field"},
             }
         }))
 
@@ -252,24 +251,23 @@ async def mic_stream_vad():
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 audio_b64 = base64.b64encode(data).decode("utf-8")
                 await upstream.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
-                await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                # Do NOT commit here with server VAD
                 await asyncio.sleep(CHUNK / RATE)  # ~20ms
 
         async def recv_transcription():
-            buf: Dict[str, str] = {}
             async for message in upstream:
                 evt = json.loads(message)
                 et = evt.get("type")
                 if et == "input_audio_buffer.speech_started":
                     tts_player.stop()
-                elif et == "conversation.item.input_audio_transcription.delta":
-                    delta = evt.get("delta", "")
-                    buf.setdefault(evt.get("item_id"), "")
-                    buf[evt.get("item_id")] += delta
-                elif et == "conversation.item.input_audio_transcription.completed":
+                elif et in ("conversation.item.input_audio_transcription.delta",
+                            "transcription.delta",
+                            "response.audio_transcript.delta"):
+                    pass  # could log partials for debugging
+                elif et in ("conversation.item.input_audio_transcription.completed",
+                            "transcription.completed"):
                     user_text = evt.get("transcript", "")
                     await determine_intent(ChatMessage(message=user_text))
-                    buf.pop(evt.get("item_id"), None)
                 elif et in ("error", "response.error"):
                     print("UPSTREAM ERROR (server mic):", json.dumps(evt, indent=2))
 
@@ -328,7 +326,6 @@ async def stream_tts_to_browser(ws: WebSocket, text: str, tts: TTSSession):
                 input=text,
                 response_format="pcm",
             ) as resp:
-                # handle optional cancel_event arg gracefully
                 if "cancel_event" in tts_player.play_pcm_stream.__code__.co_varnames:
                     await tts_player.play_pcm_stream(resp, cancel_event=tts.cancel_event)
                 else:
@@ -384,11 +381,11 @@ async def ws_stream(ws: WebSocket):
             await upstream.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "input_audio_format": { "type": "pcm16", "sample_rate_hz": 16000 },
-                    "input_audio_transcription": { "model": OPENAI_REALTIME_MODEL, "language": "en" },
-                    "turn_detection": { "type": "server_vad", "threshold": 0.32,
-                                        "prefix_padding_ms": 300, "silence_duration_ms": 350 },
-                    "input_audio_noise_reduction": { "type": "near_field" },
+                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
+                    "input_audio_transcription": {"model": OPENAI_REALTIME_MODEL, "language": "en"},
+                    "turn_detection": {"type": "server_vad", "threshold": 0.32,
+                                       "prefix_padding_ms": 300, "silence_duration_ms": 350},
+                    "input_audio_noise_reduction": {"type": "near_field"},
                 },
             }))
 
@@ -422,16 +419,28 @@ async def ws_stream(ws: WebSocket):
                             continue
 
                         if t == "audio":
-                            # incoming: base64 PCM16 mono @16k
+                            # ACK back to the browser so you SEE activity immediately
+                            try:
+                                raw = base64.b64decode(data.get("audio_b64", ""))
+                                await ws.send_text(json.dumps({
+                                    "type": "ack",
+                                    "kind": "audio",
+                                    "bytes": len(raw),
+                                }))
+                            except Exception:
+                                pass
+
+                            # Append only; with server VAD the server will commit on silence.
                             await upstream.send(json.dumps({
                                 "type": "input_audio_buffer.append",
                                 "audio": data.get("audio_b64", ""),
                             }))
-                            await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             continue
 
                         if t == "flush":
+                            # Manual force-send if you want it (e.g., a button on the page)
                             await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            continue
                 except WebSocketDisconnect:
                     pass
 
@@ -464,10 +473,13 @@ async def ws_stream(ws: WebSocket):
                         await ws.send_text(json.dumps({"type": "tts_stop"}))
                         await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
 
-                    elif et in ("conversation.item.input_audio_transcription.delta", "transcription.delta"):
+                    elif et in ("conversation.item.input_audio_transcription.delta",
+                                "transcription.delta",
+                                "response.audio_transcript.delta"):
                         await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
 
-                    elif et in ("conversation.item.input_audio_transcription.completed", "transcription.completed"):
+                    elif et in ("conversation.item.input_audio_transcription.completed",
+                                "transcription.completed"):
                         user_text = evt.get("transcript", "")
                         res = await determine_intent(ChatMessage(message=user_text))
                         reply = res.get("result", "")
