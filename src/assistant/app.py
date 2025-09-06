@@ -24,11 +24,12 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(
 API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 RATE = 16000
-CHUNK = 320  # 20ms @ 16kHz for server mic (if used)
+CHUNK = 320  # 20ms @ 16kHz for server mic (optional loop)
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-transcribe")
+# Use a Realtime session model (not a transcription model)
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
 # =========================================================
@@ -89,7 +90,7 @@ async def speak_tts(text: str):
 
 
 # =========================================================
-# Intent via GPT
+# Intent via GPT (text → intent routing)
 # =========================================================
 async def determine_intent_gpt(message: str) -> Dict[str, str]:
     system_prompt = render_intent_prompt()
@@ -216,7 +217,7 @@ async def determine_intent(msg: ChatMessage):
 
 
 # =========================================================
-# Server-mic loop (local dev only)
+# Server-mic loop (local dev only, optional)
 # =========================================================
 async def mic_stream_vad():
     """Optional: capture from server mic and stream to Realtime (server VAD; no per-frame commit)."""
@@ -231,12 +232,12 @@ async def mic_stream_vad():
     ]
 
     async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as upstream:
-        # Configure session
+        # Configure session: realtime model + whisper-1 for input transcription
         await upstream.send(json.dumps({
             "type": "session.update",
             "session": {
                 "input_audio_format": {"type": "pcm16", "sample_rate_hz": RATE},
-                "input_audio_transcription": {"model": OPENAI_REALTIME_MODEL, "language": "en"},
+                "input_audio_transcription": {"model": "whisper-1", "language": "en"},
                 "turn_detection": {"type": "server_vad", "threshold": 0.32,
                                    "prefix_padding_ms": 300, "silence_duration_ms": 350},
                 "input_audio_noise_reduction": {"type": "near_field"},
@@ -251,7 +252,7 @@ async def mic_stream_vad():
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 audio_b64 = base64.b64encode(data).decode("utf-8")
                 await upstream.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
-                # Do NOT commit here with server VAD
+                # With server VAD, do NOT commit per frame.
                 await asyncio.sleep(CHUNK / RATE)  # ~20ms
 
         async def recv_transcription():
@@ -263,7 +264,7 @@ async def mic_stream_vad():
                 elif et in ("conversation.item.input_audio_transcription.delta",
                             "transcription.delta",
                             "response.audio_transcript.delta"):
-                    pass  # could log partials for debugging
+                    pass  # could log partials
                 elif et in ("conversation.item.input_audio_transcription.completed",
                             "transcription.completed"):
                     user_text = evt.get("transcript", "")
@@ -366,138 +367,131 @@ async def ws_stream(ws: WebSocket):
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
+        # Keep socket open so ping/ack still work
         await ws.send_text(json.dumps({"type": "error", "detail": "Missing OPENAI_API_KEY"}))
-        await ws.close()
-        return
 
     headers = [
         ("Authorization", f"Bearer {api_key}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
 
-    try:
-        async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as upstream:
-            # Configure session for browser mic stream
+    upstream_ref = {"conn": None}
+    connect_err = {"exc": None}
+
+    async def connect_upstream():
+        if not api_key:
+            connect_err["exc"] = RuntimeError("OPENAI_API_KEY not set")
+            return
+        try:
+            upstream = await websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers)
+            # Configure session: realtime model + whisper-1 for input transcription
             await upstream.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
-                    "input_audio_transcription": {"model": OPENAI_REALTIME_MODEL, "language": "en"},
+                    "input_audio_transcription": {"model": "whisper-1", "language": "en"},
                     "turn_detection": {"type": "server_vad", "threshold": 0.32,
                                        "prefix_padding_ms": 300, "silence_duration_ms": 350},
                     "input_audio_noise_reduction": {"type": "near_field"},
                 },
             }))
+            upstream_ref["conn"] = upstream
+            await ws.send_text(json.dumps({"type": "status", "upstream": "ok"}))
+        except Exception as e:
+            connect_err["exc"] = e
+            await ws.send_text(json.dumps({
+                "type": "error",
+                "detail": f"upstream_connect_failed: {type(e).__name__}: {str(e)}"
+            }))
 
-            async def ping():
-                while True:
-                    try:
-                        await upstream.send(json.dumps({"type": "ping", "timestamp": time.time()}))
-                        await asyncio.sleep(20)
-                    except Exception:
-                        break
+    # Start connecting in the background (non-blocking)
+    asyncio.create_task(connect_upstream())
 
-            async def forward_up():
-                try:
-                    while True:
-                        # Expecting JSON text frames from browser
-                        msg = await ws.receive_text()
-                        try:
-                            data = json.loads(msg)
-                        except Exception:
-                            # ignore non-JSON frames
-                            continue
-
-                        t = data.get("type")
-                        if t == "ping":
-                            await ws.send_text(json.dumps({"type": "pong", "t": time.time()}))
-                            continue
-
-                        if t == "barge_in":
-                            tts.cancel()
-                            await ws.send_text(json.dumps({"type": "tts_stop"}))
-                            continue
-
-                        if t == "audio":
-                            # ACK back to the browser so you SEE activity immediately
-                            try:
-                                raw = base64.b64decode(data.get("audio_b64", ""))
-                                await ws.send_text(json.dumps({
-                                    "type": "ack",
-                                    "kind": "audio",
-                                    "bytes": len(raw),
-                                }))
-                            except Exception:
-                                pass
-
-                            # Append only; with server VAD the server will commit on silence.
-                            await upstream.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": data.get("audio_b64", ""),
-                            }))
-                            continue
-
-                        if t == "flush":
-                            # Manual force-send if you want it (e.g., a button on the page)
-                            await upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                            continue
-                except WebSocketDisconnect:
-                    pass
-
-            async def forward_down():
-                async for raw in upstream:
-                    evt = json.loads(raw)
-                    et = evt.get("type")
-
-                    if et in ("error", "response.error"):
-                        # Surface upstream errors to browser + server logs
-                        print("UPSTREAM ERROR:", json.dumps(evt, indent=2))
-                        try:
-                            await ws.send_text(json.dumps({"type": "error", "detail": evt}))
-                        except Exception:
-                            pass
-                        continue
-
-                    # Optional heartbeat to understand upstream flow
-                    if et not in (
-                        "conversation.item.input_audio_transcription.delta",
-                        "input_audio_buffer.speech_started",
-                        "conversation.item.input_audio_transcription.completed",
-                        "input_audio_buffer.committed",
-                        "input_audio_buffer.speech_stopped",
-                    ):
-                        print("upstream evt:", et)
-
-                    if et == "input_audio_buffer.speech_started":
-                        tts.cancel()
-                        await ws.send_text(json.dumps({"type": "tts_stop"}))
-                        await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
-
-                    elif et in ("conversation.item.input_audio_transcription.delta",
-                                "transcription.delta",
-                                "response.audio_transcript.delta"):
-                        await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
-
-                    elif et in ("conversation.item.input_audio_transcription.completed",
-                                "transcription.completed"):
-                        user_text = evt.get("transcript", "")
-                        res = await determine_intent(ChatMessage(message=user_text))
-                        reply = res.get("result", "")
-                        await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
-                        tts.cancel()
-                        tts.reset()
-                        tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
-
-            await asyncio.gather(ping(), forward_up(), forward_down())
-
-    except Exception as e:
-        print("ws_stream error:", e)
+    async def client_loop():
         try:
-            await ws.close()
-        except Exception:
+            while True:
+                msg = await ws.receive_text()
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+
+                t = data.get("type")
+                if t == "ping":
+                    status = "ok" if upstream_ref["conn"] else ("error" if connect_err["exc"] else "connecting")
+                    await ws.send_text(json.dumps({"type": "pong", "t": time.time(), "upstream": status}))
+                elif t == "barge_in":
+                    tts.cancel()
+                    await ws.send_text(json.dumps({"type": "tts_stop"}))
+                elif t == "audio":
+                    # ACK immediately so you see activity even without upstream
+                    try:
+                        raw = base64.b64decode(data.get("audio_b64", ""))
+                        await ws.send_text(json.dumps({"type": "ack", "kind": "audio", "bytes": len(raw)}))
+                    except Exception:
+                        await ws.send_text(json.dumps({"type": "ack", "kind": "audio", "bytes": 0}))
+
+                    # If upstream is ready, forward the audio chunk
+                    if upstream_ref["conn"]:
+                        await upstream_ref["conn"].send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": data.get("audio_b64", ""),
+                        }))
+                    # With server VAD, do NOT commit per frame.
+                elif t == "flush":
+                    if upstream_ref["conn"]:
+                        await upstream_ref["conn"].send(json.dumps({"type": "input_audio_buffer.commit"}))
+                # ignore unknown types
+        except WebSocketDisconnect:
             pass
-    finally:
-        tts.cancel()
+        finally:
+            try:
+                if upstream_ref["conn"]:
+                    await upstream_ref["conn"].close()
+            except Exception:
+                pass
+            tts.cancel()
+
+    async def upstream_loop():
+        # Wait until upstream either connects or definitively fails
+        while upstream_ref["conn"] is None and connect_err["exc"] is None:
+            await asyncio.sleep(0.05)
+        if connect_err["exc"] is not None or upstream_ref["conn"] is None:
+            return  # stay in client_loop so pings/acks keep working
+
+        upstream = upstream_ref["conn"]
+        async for raw in upstream:
+            evt = json.loads(raw)
+            et = evt.get("type")
+
+            if et in ("error", "response.error"):
+                try:
+                    await ws.send_text(json.dumps({"type": "error", "detail": evt}))
+                except Exception:
+                    pass
+                continue
+
+            if et == "input_audio_buffer.speech_started":
+                tts.cancel()
+                await ws.send_text(json.dumps({"type": "tts_stop"}))
+                await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
+
+            elif et in ("conversation.item.input_audio_transcription.delta",
+                        "transcription.delta",
+                        "response.audio_transcript.delta"):
+                await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
+
+            elif et in ("conversation.item.input_audio_transcription.completed",
+                        "transcription.completed"):
+                user_text = evt.get("transcript", "")
+                res = await determine_intent(ChatMessage(message=user_text))
+                reply = res.get("result", "")
+                await ws.send_text(json.dumps({"type": "final", "text": user_text, "reply": reply}))
+                tts.cancel(); tts.reset()
+                tts.task = asyncio.create_task(stream_tts_to_browser(ws, reply, tts))
+
+    # Run both loops; client_loop keeps the socket alive even if upstream fails
+    await asyncio.gather(client_loop(), upstream_loop())
 
 
 # =========================================================
