@@ -1,39 +1,49 @@
-class PCMPlayerProcessor extends AudioWorkletProcessor {
+// Receives {type:'audio', samples: Float32Array} and plays them.
+// {type:'flush'} clears queued audio immediately.
+class PCMPlayer extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.queue = [];       // array of Float32Array chunks
-    this.readIdx = 0;
+    this.queue = []; // array of Float32Array
+    this.readIndex = 0;
 
     this.port.onmessage = (e) => {
-      const { type, samples } = e.data || {};
-      if (type === "audio" && samples) {
-        // samples is a Float32Array
-        this.queue.push(samples);
-      } else if (type === "flush") {
-        this.queue.length = 0;
-        this.readIdx = 0;
+      const msg = e.data || {};
+      if (msg.type === 'audio' && msg.samples && msg.samples.buffer) {
+        // msg.samples is transferred; take ownership of its buffer
+        const f32 = new Float32Array(msg.samples.buffer);
+        if (f32.length > 0) this.queue.push(f32);
+      } else if (msg.type === 'flush') {
+        this.queue = [];
+        this.readIndex = 0;
       }
     };
   }
 
-  process(_inputs, outputs) {
-    const out = outputs[0][0]; // mono
-    let i = 0;
-
-    while (i < out.length) {
-      if (this.queue.length === 0) {
-        // no data -> play silence to keep clock running
-        out[i++] = 0;
-        continue;
-      }
-      const chunk = this.queue[0];
-      out[i++] = chunk[this.readIdx++];
-      if (this.readIdx >= chunk.length) {
-        this.queue.shift();
-        this.readIdx = 0;
-      }
+  _pullSample() {
+    // Return next sample from queue or 0 if empty
+    if (this.queue.length === 0) return 0;
+    const curr = this.queue[0];
+    const v = curr[this.readIndex++];
+    if (this.readIndex >= curr.length) {
+      this.queue.shift();
+      this.readIndex = 0;
     }
-    return true; // keep alive
+    return v ?? 0;
+  }
+
+  process(inputs, outputs) {
+    const output = outputs[0];
+    if (!output || output.length === 0) return true;
+    const ch0 = output[0];
+    const ch1 = output.length > 1 ? output[1] : null;
+
+    for (let i = 0; i < ch0.length; i++) {
+      const s = this._pullSample();
+      ch0[i] = s;
+      if (ch1) ch1[i] = s;
+    }
+    return true;
   }
 }
-registerProcessor("pcm-player", PCMPlayerProcessor);
+
+registerProcessor('pcm-player', PCMPlayer);
