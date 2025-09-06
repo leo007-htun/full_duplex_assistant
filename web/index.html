@@ -51,11 +51,11 @@ const ECHO_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host
 let ws, wsRetry=0, pingTimer=null;
 let audioCtx=null, stream=null, running=false;
 let micNode=null, micSink=null;
+let commitTicker=null;
 
 /* ===== Client-side commit gating ===== */
-let framesSinceCommit = 0;
-const FRAMES_PER_COMMIT_MIN = 6; // 6*20ms=120ms
-
+let framesSinceCommit = 0;                 // increments per 20ms frame
+const FRAMES_PER_COMMIT_MIN = 6;           // 6 * 20ms = 120ms
 function tryFlush(){
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (framesSinceCommit >= FRAMES_PER_COMMIT_MIN) {
@@ -114,7 +114,7 @@ async function ensureTTSContext(sampleRateHint=24000){
   if (ttsCtx && ttsNode) return;
   ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
   try {
-    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js');
+    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js?v=2');
   } catch (e) {
     console.error('Failed to load /pcm-player-processor.js', e);
     setStatus('Failed to load TTS worklet','error');
@@ -129,13 +129,13 @@ function ttsStopLocal(){ ttsFlush(); ttsPlaying=false; }
 /* =========================
    Partial/final logic + VAD + barge-in
 ========================= */
-const VAD_THRESHOLD     = 0.012;  // adjust 0.008–0.02 for room noise
-const VAD_SILENCE_MS    = 700;    // flush after this much silence
-const FINAL_FALLBACK_MS = 1400;   // if no 'final' after last partial
-const NO_VAD_MAX_MS     = 1800;   // speech energy but no partials → flush
+const VAD_THRESHOLD     = 0.012;   // adjust 0.008–0.02 for room noise
+const VAD_SILENCE_MS    = 700;     // flush after this much silence
+const FINAL_FALLBACK_MS = 1400;    // if no 'final' after last partial
+const NO_VAD_MAX_MS     = 1800;    // speech energy but no partials → flush
 
 const BARGE_THRESHOLD = 0.04;
-const BARGE_FRAMES    = 4; // ~80ms if 20ms frames
+const BARGE_FRAMES    = 4;         // ~80ms if 20ms frames
 let bargeCount = 0;
 
 let partialBuf = "";
@@ -164,6 +164,7 @@ function attachWS(socket){
     console.warn("[WS] close", e.code, e.reason);
     setStatus("WebSocket closed ("+e.code+")","error");
     if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+    if (commitTicker){ clearInterval(commitTicker); commitTicker=null; }
     if (running) {
       const backoff = Math.min(1000 * Math.pow(2, wsRetry++), 10000);
       setTimeout(() => { connectWS(); }, backoff);
@@ -175,6 +176,8 @@ function attachWS(socket){
     if (m.type === "ack") log("ACK:", m.kind, m.bytes+"B");
     if (m.type === "error") log("UPSTREAM ERROR:", JSON.stringify(m.detail));
     if (m.type === "status") log("Upstream:", m.upstream);
+    if (m.type === "commit_sent")     log(`COMMIT sent: ~${m.ms} ms (${m.src})`);
+    if (m.type === "commit_deferred") log(`COMMIT deferred: have ${m.have_ms} ms, need +${m.need_ms} ms (${m.src})`);
 
     if (m.type === "event" && m.name === "speech_started") {
       ttsStopLocal(); ttsBarged = true;
@@ -184,6 +187,7 @@ function attachWS(socket){
     }
 
     if (m.type === "partial") {
+      // accumulate
       partialBuf += m.text || "";
       $('partial').textContent = partialBuf;
       if (finalFallbackTimer) clearTimeout(finalFallbackTimer);
@@ -260,9 +264,9 @@ async function start(){
 
   try {
     // IMPORTANT: this file must registerProcessor('mic-capture-v2', ...)
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor-v2.js?v=2');
   } catch (e) {
-    console.error('Failed to load /mic-capture-processor.js', e);
+    console.error('Failed to load /mic-capture-processor-v2.js', e);
     setStatus('Failed to load mic worklet','error'); running=false; return;
   }
 
@@ -275,6 +279,8 @@ async function start(){
   });
 
   let framesSent = 0;
+  let lastFrameT = performance.now();
+  let silenceMs = 0;
 
   micNodeLocal.port.onmessage = (e)=>{
     const { type, samples, rate, frame_len } = e.data || {};
@@ -288,7 +294,7 @@ async function start(){
       const level = rms(samples);
       setMeter(level * 1.8);
 
-      // Local barge-in
+      // Local barge-in: short sustained loudness
       if (level > BARGE_THRESHOLD && ttsPlaying && !ttsBarged) {
         if (++bargeCount >= BARGE_FRAMES) {
           ttsStopLocal();
@@ -300,16 +306,14 @@ async function start(){
         bargeCount = 0;
       }
 
-      // Silence VAD → flush
+      // Simple silence-based flush
       const now = performance.now();
       const dt  = Math.max(0, now - lastFrameT);
       lastFrameT = now;
 
       if (level > VAD_THRESHOLD) {
-        if (!wasSpeaking) {
-          if (noVadTimer) clearTimeout(noVadTimer);
-          noVadTimer = setTimeout(()=>{ tryFlush(); }, NO_VAD_MAX_MS);
-        }
+        if (noVadTimer) clearTimeout(noVadTimer);
+        noVadTimer = setTimeout(()=>{ tryFlush(); }, NO_VAD_MAX_MS);
         wasSpeaking = true;
         silenceMs = 0;
       } else if (wasSpeaking) {
@@ -331,7 +335,7 @@ async function start(){
           frame_samples: samples.length, // 320
           audio_b64: toB64(new Uint8Array(i16.buffer))
         }));
-        framesSinceCommit++; // for commit gating
+        framesSinceCommit++;                 // for client commit gating
         if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
       } catch (err) {
         console.error('WS send failed', err);
@@ -345,6 +349,9 @@ async function start(){
 
   micNode = micNodeLocal;
 
+  // periodic safety commit (still gated)
+  if (!commitTicker) commitTicker = setInterval(()=>{ tryFlush(); }, 1000);
+
   $('start').disabled = true; $('stop').disabled = false;
   setStatus("Listening…","listen");
 }
@@ -352,7 +359,7 @@ async function start(){
 async function stop(){
   running=false;
 
-  // finalize current turn & stop TTS
+  // stop TTS and finalize turn
   try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); } catch (e) {}
   tryFlush();
   try { await new Promise(r => setTimeout(r, 200)); } catch (e) {}
@@ -363,6 +370,7 @@ async function stop(){
   try{ if (audioCtx) audioCtx.close(); }catch(e){}
   try{ if (ws) ws.close(); }catch(e){}
   if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
+  if (commitTicker) { clearInterval(commitTicker); commitTicker=null; }
   ttsStopLocal();
   micNode=null; micSink=null; stream=null; audioCtx=null;
   $('start').disabled = false; $('stop').disabled = true;
