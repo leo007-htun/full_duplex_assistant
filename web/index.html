@@ -3,100 +3,89 @@
 <head>
 <meta charset="UTF-8">
 <title>Browser Voice Assistant</title>
-<style>
-  body { font-family: sans-serif; margin: 2rem; }
-  #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; height: 300px; overflow-y: auto; }
-  button { margin-right: 1rem; }
-</style>
 </head>
 <body>
-
-<h1>Voice Assistant</h1>
+<h1>Browser Voice Assistant</h1>
 <button id="startBtn">Start Listening</button>
-<button id="stopBtn">Stop Listening</button>
-
-<div id="log"></div>
+<p id="transcript"></p>
+<p id="response"></p>
 
 <script>
-const logEl = document.getElementById("log");
-
-function log(msg) {
-  logEl.textContent += msg + "\n";
-  logEl.scrollTop = logEl.scrollHeight;
-}
-
-// -------------------
-// WebSocket to FastAPI
-// -------------------
-const ws = new WebSocket("wss://com-cloud.cloud/ws/stream");
-
-ws.onopen = () => log("[WebSocket] Connected");
-ws.onclose = () => log("[WebSocket] Disconnected");
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  if(data.type === "gpt_response") {
-    log(`[GPT] Intent: ${data.intent}, Response: ${data.text}`);
-    speakTTS(data.text);
-  }
-};
-
-// -------------------
-// Web Speech Recognition
-// -------------------
 let recognition;
-let recognizing = false;
+let isListening = false;
+let currentUtterance = null;
 
-if('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  recognition = new SpeechRecognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = "en-US";
+// Check for browser STT support
+if (!('webkitSpeechRecognition' in window)) {
+    alert("Browser does not support SpeechRecognition API");
+} else {
+    recognition = new webkitSpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
 
-  recognition.onstart = () => { recognizing = true; log("[STT] Listening..."); }
-  recognition.onend = () => { recognizing = false; log("[STT] Stopped"); }
-  recognition.onerror = (e) => log("[STT] Error: " + e.error);
+    recognition.onresult = (event) => {
+        let transcript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            transcript += event.results[i][0].transcript;
+        }
+        document.getElementById('transcript').innerText = transcript;
 
-  recognition.onresult = (event) => {
-    let transcript = '';
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-      transcript += event.results[i][0].transcript;
-    }
-    if(transcript.trim()) {
-      log("[STT] " + transcript);
-      ws.send(JSON.stringify({ type: "user_text", text: transcript }));
-    }
-  };
+        // Detect VAD (voice is speaking) and stop TTS
+        if (event.results[event.results.length-1].isFinal) {
+            stopTTS();
+            sendToServer(transcript);
+        }
+    };
+
+    recognition.onend = () => {
+        if (isListening) recognition.start(); // auto-restart
+    };
 }
 
-// -------------------
-// TTS (Interruptible)
-// -------------------
-let ttsUtterance;
-function speakTTS(text) {
-  stopTTS(); // stop previous speech
-  if('speechSynthesis' in window) {
-    ttsUtterance = new SpeechSynthesisUtterance(text);
-    speechSynthesis.speak(ttsUtterance);
-  }
+document.getElementById('startBtn').addEventListener('click', () => {
+    if (!isListening) {
+        recognition.start();
+        isListening = true;
+    } else {
+        recognition.stop();
+        isListening = false;
+    }
+});
+
+// --------------------
+// TTS functions
+// --------------------
+function playTTS(text) {
+    stopTTS();
+    currentUtterance = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(currentUtterance);
 }
 
 function stopTTS() {
-  if('speechSynthesis' in window) {
-    speechSynthesis.cancel(); // stop immediately
-  }
+    if (currentUtterance) {
+        window.speechSynthesis.cancel();
+        currentUtterance = null;
+    }
 }
 
-// -------------------
-// Buttons
-// -------------------
-document.getElementById("startBtn").onclick = () => {
-  if(!recognizing) recognition.start();
-};
-document.getElementById("stopBtn").onclick = () => {
-  if(recognizing) recognition.stop();
-};
+// --------------------
+// Send transcript to FastAPI
+// --------------------
+async function sendToServer(text) {
+    try {
+        const resp = await fetch("https://com-cloud.cloud/api/determine_intent", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({message: text})
+        });
+        const data = await resp.json();
+        document.getElementById('response').innerText = data.result;
+        playTTS(data.result);
+    } catch (err) {
+        console.error("Error sending to server:", err);
+    }
+}
 </script>
-
 </body>
 </html>
