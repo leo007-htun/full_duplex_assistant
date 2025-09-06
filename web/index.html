@@ -2,101 +2,70 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Realtime Voice Assistant</title>
-<style>
-  body { font-family:sans-serif; padding:16px; background:#0b0e14; color:#e6edf3; }
-  button { margin:8px; padding:10px 16px; border-radius:8px; border:none; cursor:pointer; }
-  button.primary { background:#76b3fa; color:#0a1020; font-weight:bold; }
-  #output { border:1px solid #444; padding:12px; border-radius:8px; min-height:300px; overflow:auto; background:#131721; }
-</style>
+<title>Voice Assistant</title>
 </head>
 <body>
-
-<h1>Realtime Voice Assistant</h1>
-<button id="startBtn" class="primary">Start Listening</button>
-<button id="stopBtn" disabled>Stop</button>
-<div id="output"></div>
+<button id="start">Start Listening</button>
+<div id="transcript"></div>
 
 <script>
+let recognizing = false;
 let recognition;
-let audioCtx, ttsSource;
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-const output = document.getElementById('output');
+let ttsUtterance;
+let speechSynthesisActive = false;
 
-// -------------------- Web Speech Recognition --------------------
-function startRecognition() {
-  recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = 'en-US';
+if ('webkitSpeechRecognition' in window) {
+    recognition = new webkitSpeechRecognition();
+} else if ('SpeechRecognition' in window) {
+    recognition = new SpeechRecognition();
+}
 
-  recognition.onresult = async (event) => {
+recognition.continuous = true;
+recognition.interimResults = true;
+recognition.lang = 'en-US';
+
+recognition.onresult = async (event) => {
     let transcript = '';
-    for(let i=event.resultIndex;i<event.results.length;i++){
-      transcript += event.results[i][0].transcript;
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+        transcript += event.results[i][0].transcript;
     }
-    output.textContent = transcript;
+    document.getElementById('transcript').innerText = transcript;
 
-    // Detect VAD: user is talking → stop TTS immediately
-    stopTTS();
+    if (event.results[event.results.length-1].isFinal) {
+        // Stop ongoing TTS if user starts talking
+        if (speechSynthesisActive) {
+            window.speechSynthesis.cancel();
+            speechSynthesisActive = false;
+        }
 
-    // Send text to backend
-    try {
-      const resp = await fetch('/determine_intent', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({message: transcript})
-      });
-      const data = await resp.json();
-      playTTS(data.result);
-    } catch(e) {
-      console.error('Error fetching intent:', e);
+        // Send to FastAPI
+        const res = await fetch('/api/determine_intent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: transcript })
+        });
+        const data = await res.json();
+        speak(data.result);
     }
-  };
+};
 
-  recognition.onstart = () => { startBtn.textContent = 'Listening...'; };
-  recognition.onend = () => { startBtn.textContent = 'Start Listening'; };
-  recognition.onerror = (e) => { console.error(e); };
-
-  recognition.start();
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
+function speak(text) {
+    if (!text) return;
+    ttsUtterance = new SpeechSynthesisUtterance(text);
+    ttsUtterance.onstart = () => { speechSynthesisActive = true; };
+    ttsUtterance.onend = () => { speechSynthesisActive = false; };
+    window.speechSynthesis.speak(ttsUtterance);
 }
 
-function stopRecognition() {
-  if(recognition) recognition.stop();
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-  stopTTS();
-}
-
-// -------------------- Web Audio TTS --------------------
-function playTTS(text) {
-  stopTTS();
-  if(!text) return;
-
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'en-US';
-
-  utterance.onstart = () => console.log('TTS started');
-  utterance.onend = () => console.log('TTS ended');
-
-  speechSynthesis.speak(utterance);
-  ttsSource = utterance;
-}
-
-function stopTTS() {
-  if(ttsSource) {
-    speechSynthesis.cancel();
-    ttsSource = null;
-  }
-}
-
-// -------------------- Button Events --------------------
-startBtn.onclick = startRecognition;
-stopBtn.onclick = stopRecognition;
+document.getElementById('start').onclick = () => {
+    if (!recognizing) {
+        recognition.start();
+        recognizing = true;
+    } else {
+        recognition.stop();
+        recognizing = false;
+    }
+};
 </script>
 </body>
 </html>
