@@ -9,7 +9,6 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.port.onmessage = (e) => {
       const msg = e.data || {};
       if (msg.type === 'audio' && msg.samples && msg.samples.buffer) {
-        // msg.samples is transferred; take ownership of its buffer
         const f32 = new Float32Array(msg.samples.buffer);
         if (f32.length > 0) this.queue.push(f32);
       } else if (msg.type === 'flush') {
@@ -20,7 +19,6 @@ class PCMPlayer extends AudioWorkletProcessor {
   }
 
   _pullSample() {
-    // Return next sample from queue or 0 if empty
     if (this.queue.length === 0) return 0;
     const curr = this.queue[0];
     const v = curr[this.readIndex++];
@@ -28,7 +26,7 @@ class PCMPlayer extends AudioWorkletProcessor {
       this.queue.shift();
       this.readIndex = 0;
     }
-    return v ?? 0;
+    return v || 0;
   }
 
   process(inputs, outputs) {
