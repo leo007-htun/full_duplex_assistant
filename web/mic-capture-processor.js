@@ -3,20 +3,25 @@
 class MicCaptureProcessorV2 extends AudioWorkletProcessor {
   constructor({ processorOptions = {} } = {}) {
     super();
-    this.outRate  = Math.floor(processorOptions.downsampleTo || 16000);
-    this.frameMs  = Math.floor(processorOptions.postIntervalMs || 20);
-    this.frameLen = Math.floor(this.outRate * this.frameMs / 1000); // 320 @ 20ms
 
-    // If input/output ratio is integer (e.g., 48k→16k), use exact decimation
-    this.decim = Math.round(sampleRate / this.outRate);
+    // ---- config (with guards) ----
+    const cfgRate = Number(processorOptions.downsampleTo) || 16000;
+    const cfgMs   = Number(processorOptions.postIntervalMs) || 20;
+
+    this.outRate  = Math.max(1, Math.floor(cfgRate));
+    this.frameMs  = Math.max(1, Math.floor(cfgMs));
+    this.frameLen = Math.max(1, Math.floor(this.outRate * this.frameMs / 1000)); // e.g., 320 @ 16k/20ms
+
+    // Integer decimation if possible (e.g., 48000 -> 16000 uses /3)
+    this.decim = Math.max(1, Math.round(sampleRate / this.outRate));
     this.integerDecim = Math.abs(sampleRate - this.outRate * this.decim) < 1e-6;
-    this.phase = 0;
+    this.phase = 0; // decimation counter
 
-    // Fallback linear resampler state (for 44.1k, etc.)
-    this.t = 0;        // accumulator in "out samples" units
-    this.prev = 0;
+    // Linear-resampler state (for 44.1k→16k etc.)
+    this.accum = 0;    // "outRate" ticks accumulated per input sample
+    this.prev  = 0;    // previous input sample
 
-    // Buffer to carve fixed frames out of
+    // Output buffer we fill and carve into fixed frames
     this.buf = new Float32Array(this.frameLen * 4);
     this.bufLen = 0;
 
@@ -30,9 +35,9 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
 
   _ensureCapacity(n) {
     if (this.bufLen + n <= this.buf.length) return;
-    const grown = new Float32Array(Math.max(this.buf.length * 2, this.bufLen + n));
-    grown.set(this.buf.subarray(0, this.bufLen));
-    this.buf = grown;
+    const next = new Float32Array(Math.max(this.buf.length * 2, this.bufLen + n));
+    next.set(this.buf.subarray(0, this.bufLen));
+    this.buf = next;
   }
 
   _pushSample(v) {
@@ -43,39 +48,64 @@ class MicCaptureProcessorV2 extends AudioWorkletProcessor {
   _postFramesIfReady() {
     while (this.bufLen >= this.frameLen) {
       const chunk = new Float32Array(this.frameLen);
+      // copy out first frameLen
       chunk.set(this.buf.subarray(0, this.frameLen));
-      // shift remainder left
+      // shift remainder down
       this.buf.copyWithin(0, this.frameLen, this.bufLen);
       this.bufLen -= this.frameLen;
-
-      // Post as transferable
-      this.port.postMessage({ type: 'audio', samples: chunk, rate: this.outRate, frame_len: this.frameLen }, [chunk.buffer]);
+      // Post as transferable to avoid copies
+      this.port.postMessage(
+        { type: 'audio', samples: chunk, rate: this.outRate, frame_len: this.frameLen },
+        [chunk.buffer]
+      );
     }
   }
 
   process(inputs) {
-    const input = inputs[0];
-    if (!input || input.length === 0 || input[0].length === 0) return true;
-    const ch0 = input[0];
+    const input = inputs && inputs[0];
+    if (!input || input.length === 0) return true;
+
+    // Take first channel (or mix to mono if multiple)
+    let ch = input[0];
+    if (!ch || ch.length === 0) return true;
+
+    // If more than one channel, very light mono mix (L only is fine too)
+    if (input.length > 1) {
+      const L = input[0], R = input[1];
+      const N = Math.min(L.length, R ? R.length : 0);
+      if (N > 0) {
+        // quick in-place-ish average into L (saves an alloc)
+        // falls back to L if R missing/short
+        for (let i = 0; i < N; i++) L[i] = 0.5 * (L[i] + (R ? R[i] : 0));
+        ch = L;
+      }
+    }
 
     if (this.integerDecim && this.decim >= 1) {
-      // Exact 48k -> 16k path (decimate by 3)
-      for (let i = 0; i < ch0.length; i++) {
-        if ((this.phase++ % this.decim) === 0) this._pushSample(ch0[i]);
+      // Exact decimation path (e.g., 48k -> 16k by 3)
+      for (let i = 0; i < ch.length; i++) {
+        if (this.phase === 0) this._pushSample(ch[i]);
+        this.phase++;
+        if (this.phase >= this.decim) this.phase = 0; // avoid unbounded growth
       }
     } else {
-      // Generic linear resampler (handles 44.1k -> 16k, etc.)
-      const inRate = sampleRate;
+      // Generic linear resampler (44.1k -> 16k, etc.)
+      // Accumulate "outRate" ticks per input sample; emit whenever >= inRate.
+      // Interpolate between prev and curr at fractional position.
+      const inRate  = sampleRate;
       const outRate = this.outRate;
       let prev = this.prev;
-      for (let i = 0; i < ch0.length; i++) {
-        const curr = ch0[i];
-        this.t += outRate;
-        while (this.t >= inRate) {
-          const frac = (this.t - inRate) / outRate;
+
+      for (let i = 0; i < ch.length; i++) {
+        const curr = ch[i];
+        this.accum += outRate;
+
+        while (this.accum >= inRate) {
+          // fraction along [prev -> curr] where the output falls within this input step
+          const frac = (this.accum - inRate) / outRate; // in [0, 1)
           const y = prev + (curr - prev) * frac;
           this._pushSample(y);
-          this.t -= inRate;
+          this.accum -= inRate;
         }
         prev = curr;
       }
