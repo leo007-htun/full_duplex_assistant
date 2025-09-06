@@ -15,7 +15,9 @@ let recognition;
 let isListening = false;
 let currentUtterance = null;
 
-// Check for browser STT support
+// --------------------
+// Speech Recognition Setup
+// --------------------
 if (!('webkitSpeechRecognition' in window)) {
     alert("Browser does not support SpeechRecognition API");
 } else {
@@ -31,10 +33,14 @@ if (!('webkitSpeechRecognition' in window)) {
         }
         document.getElementById('transcript').innerText = transcript;
 
-        // Detect VAD (voice is speaking) and stop TTS
-        if (event.results[event.results.length-1].isFinal) {
-            stopTTS();
-            sendToServer(transcript);
+        // When final speech is detected
+        if (event.results[event.results.length - 1].isFinal) {
+            stopTTS(); // make sure TTS is cut immediately
+
+            // Small delay to avoid overlap
+            setTimeout(() => {
+                sendToServer(transcript);
+            }, 150);
         }
     };
 
@@ -57,16 +63,16 @@ document.getElementById('startBtn').addEventListener('click', () => {
 // TTS functions
 // --------------------
 function playTTS(text) {
-    stopTTS();
+    stopTTS(); // ensure no overlap
     currentUtterance = new SpeechSynthesisUtterance(text);
     window.speechSynthesis.speak(currentUtterance);
 }
 
 function stopTTS() {
-    if (currentUtterance) {
-        window.speechSynthesis.cancel();
-        currentUtterance = null;
+    if (speechSynthesis.speaking || speechSynthesis.pending) {
+        window.speechSynthesis.cancel(); // force stop
     }
+    currentUtterance = null;
 }
 
 // --------------------
