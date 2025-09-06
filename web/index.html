@@ -216,7 +216,8 @@ async function start(){
   if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch (e) {} }
 
   try {
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
+    //await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor-v2.js?v=2');
   } catch (e) {
     console.error('Failed to load /mic-capture-processor.js', e);
     setStatus('Failed to load mic worklet','error');
@@ -224,7 +225,7 @@ async function start(){
   }
 
   const srcNode = audioCtx.createMediaStreamSource(stream);
-  const micNodeLocal = new AudioWorkletNode(audioCtx, 'mic-capture', {
+  const micNodeLocal = new AudioWorkletNode(audioCtx, 'mic-capture-v2', {
     numberOfInputs: 1,
     numberOfOutputs: 1,
     outputChannelCount: [1],
@@ -237,7 +238,8 @@ async function start(){
     const { type, samples, rate } = e.data || {};
 
     // optional debug message from worklet
-    if (type === 'debug' && rate) { log('Worklet rate =', rate); return; }
+    //if (type === 'debug' && rate) { log('Worklet rate =', rate); return; }
+    if (type === 'debug') { log('Worklet rate =', rate, 'frame_len =', e.data.frame_len); return; }
 
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
       // live meter for confidence
