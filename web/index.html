@@ -264,9 +264,9 @@ async function start(){
 
   try {
     // IMPORTANT: this file must registerProcessor('mic-capture-v2', ...)
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor-v2.js?v=2');
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
   } catch (e) {
-    console.error('Failed to load /mic-capture-processor-v2.js', e);
+    console.error('Failed to load /mic-capture-processor.js', e);
     setStatus('Failed to load mic worklet','error'); running=false; return;
   }
 
