@@ -2,70 +2,101 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Voice Assistant</title>
+<title>Browser Voice Assistant</title>
+<style>
+  body { font-family: sans-serif; margin: 2rem; }
+  #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; height: 300px; overflow-y: auto; }
+  button { margin-right: 1rem; }
+</style>
 </head>
 <body>
-<button id="start">Start Listening</button>
-<div id="transcript"></div>
+
+<h1>Voice Assistant</h1>
+<button id="startBtn">Start Listening</button>
+<button id="stopBtn">Stop Listening</button>
+
+<div id="log"></div>
 
 <script>
-let recognizing = false;
-let recognition;
-let ttsUtterance;
-let speechSynthesisActive = false;
+const logEl = document.getElementById("log");
 
-if ('webkitSpeechRecognition' in window) {
-    recognition = new webkitSpeechRecognition();
-} else if ('SpeechRecognition' in window) {
-    recognition = new SpeechRecognition();
+function log(msg) {
+  logEl.textContent += msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
-recognition.continuous = true;
-recognition.interimResults = true;
-recognition.lang = 'en-US';
+// -------------------
+// WebSocket to FastAPI
+// -------------------
+const ws = new WebSocket("wss://com-cloud.cloud/ws/stream");
 
-recognition.onresult = async (event) => {
+ws.onopen = () => log("[WebSocket] Connected");
+ws.onclose = () => log("[WebSocket] Disconnected");
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if(data.type === "gpt_response") {
+    log(`[GPT] Intent: ${data.intent}, Response: ${data.text}`);
+    speakTTS(data.text);
+  }
+};
+
+// -------------------
+// Web Speech Recognition
+// -------------------
+let recognition;
+let recognizing = false;
+
+if('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+
+  recognition.onstart = () => { recognizing = true; log("[STT] Listening..."); }
+  recognition.onend = () => { recognizing = false; log("[STT] Stopped"); }
+  recognition.onerror = (e) => log("[STT] Error: " + e.error);
+
+  recognition.onresult = (event) => {
     let transcript = '';
     for (let i = event.resultIndex; i < event.results.length; ++i) {
-        transcript += event.results[i][0].transcript;
+      transcript += event.results[i][0].transcript;
     }
-    document.getElementById('transcript').innerText = transcript;
-
-    if (event.results[event.results.length-1].isFinal) {
-        // Stop ongoing TTS if user starts talking
-        if (speechSynthesisActive) {
-            window.speechSynthesis.cancel();
-            speechSynthesisActive = false;
-        }
-
-        // Send to FastAPI
-        const res = await fetch('/api/determine_intent', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: transcript })
-        });
-        const data = await res.json();
-        speak(data.result);
+    if(transcript.trim()) {
+      log("[STT] " + transcript);
+      ws.send(JSON.stringify({ type: "user_text", text: transcript }));
     }
-};
-
-function speak(text) {
-    if (!text) return;
-    ttsUtterance = new SpeechSynthesisUtterance(text);
-    ttsUtterance.onstart = () => { speechSynthesisActive = true; };
-    ttsUtterance.onend = () => { speechSynthesisActive = false; };
-    window.speechSynthesis.speak(ttsUtterance);
+  };
 }
 
-document.getElementById('start').onclick = () => {
-    if (!recognizing) {
-        recognition.start();
-        recognizing = true;
-    } else {
-        recognition.stop();
-        recognizing = false;
-    }
+// -------------------
+// TTS (Interruptible)
+// -------------------
+let ttsUtterance;
+function speakTTS(text) {
+  stopTTS(); // stop previous speech
+  if('speechSynthesis' in window) {
+    ttsUtterance = new SpeechSynthesisUtterance(text);
+    speechSynthesis.speak(ttsUtterance);
+  }
+}
+
+function stopTTS() {
+  if('speechSynthesis' in window) {
+    speechSynthesis.cancel(); // stop immediately
+  }
+}
+
+// -------------------
+// Buttons
+// -------------------
+document.getElementById("startBtn").onclick = () => {
+  if(!recognizing) recognition.start();
+};
+document.getElementById("stopBtn").onclick = () => {
+  if(recognizing) recognition.stop();
 };
 </script>
+
 </body>
 </html>
