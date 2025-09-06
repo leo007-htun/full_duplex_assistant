@@ -1,22 +1,23 @@
+// /mic-capture-processor-v2.js
 // Emits fixed-size Float32 frames at downsampleTo Hz.
-// Example: 48k (in) -> 16k (out), 20ms -> 320 samples per post.
-class MicCaptureProcessor extends AudioWorkletProcessor {
+// Example: 48k -> 16k, 20ms -> 320 samples per post.
+class MicCaptureProcessorV2 extends AudioWorkletProcessor {
   constructor({ processorOptions = {} } = {}) {
     super();
     this.outRate  = Math.floor(processorOptions.downsampleTo || 16000);
     this.frameMs  = Math.floor(processorOptions.postIntervalMs || 20);
     this.frameLen = Math.floor(this.outRate * this.frameMs / 1000); // 320 @ 20ms
 
-    // If the ratio is integer (48k→16k), use exact decimation
+    // If input/output ratio is integer (e.g., 48k→16k), use exact decimation
     this.decim = Math.round(sampleRate / this.outRate);
     this.integerDecim = Math.abs(sampleRate - this.outRate * this.decim) < 1e-6;
     this.phase = 0;
 
-    // Fallback linear-resampler state (used if input rate isn't an exact multiple)
-    this.t = 0;        // accumulator (in "out samples" units)
+    // Fallback linear resampler state (for 44.1k, etc.)
+    this.t = 0;        // accumulator in "out samples" units
     this.prev = 0;
 
-    // Small buffer so we can carve fixed frames out
+    // Buffer to carve fixed frames out of
     this.buf = new Float32Array(this.frameLen * 4);
     this.bufLen = 0;
 
@@ -48,7 +49,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       this.buf.copyWithin(0, this.frameLen, this.bufLen);
       this.bufLen -= this.frameLen;
 
-      // Transfer the buffer to the main thread to avoid copies
+      // Post as transferable
       this.port.postMessage({ type: 'audio', samples: chunk, rate: this.outRate }, [chunk.buffer]);
     }
   }
@@ -59,12 +60,12 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     const ch0 = input[0];
 
     if (this.integerDecim && this.decim >= 1) {
-      // Exact 48k -> 16k path (decimate by 3, etc.)
+      // Exact 48k -> 16k path (decimate by 3)
       for (let i = 0; i < ch0.length; i++) {
         if ((this.phase++ % this.decim) === 0) this._pushSample(ch0[i]);
       }
     } else {
-      // Generic linear resampler (handles non-integer ratios like 44.1k -> 16k)
+      // Generic linear resampler (handles 44.1k -> 16k, etc.)
       const inRate = sampleRate;
       const outRate = this.outRate;
       let prev = this.prev;
@@ -83,8 +84,8 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     }
 
     this._postFramesIfReady();
-    return true; // keep processor alive
+    return true;
   }
 }
 
-registerProcessor('mic-capture', MicCaptureProcessor);
+registerProcessor('mic-capture-v2', MicCaptureProcessorV2);
