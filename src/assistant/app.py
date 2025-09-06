@@ -342,15 +342,40 @@ async def ws_stream(ws: WebSocket):
     if not api_key:
         await ws.send_text(json.dumps({"type": "error", "detail": "Missing OPENAI_API_KEY"}))
 
-    headers = [("Authorization", f"Bearer {api_key}"), ("OpenAI-Beta", "realtime=v1")]
+    headers = [
+        ("Authorization", f"Bearer {api_key}"),
+        ("OpenAI-Beta", "realtime=v1"),
+    ]
 
     upstream_ref = {"conn": None}
     connect_err = {"exc": None}
 
-    # --- commit gating state (server-side backstop) ---
-    MIN_COMMIT_MS = 150.0  # headroom over 100ms requirement
-    pending_ms = 0.0
-    flush_pending = False
+    # ---- NEW: commit gating state ----
+    pending_ms = 0.0           # uncommitted audio time we’ve appended
+    flush_pending = False      # browser asked to flush, but we don’t have enough yet
+    last_sr = 16000
+
+    async def send_commit_if_ready(source="manual"):
+        nonlocal pending_ms, flush_pending
+        if not upstream_ref["conn"]:
+            return
+        if pending_ms >= MIN_COMMIT_MS:
+            await upstream_ref["conn"].send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await ws.send_text(json.dumps({
+                "type": "commit_sent",
+                "ms": round(pending_ms, 1),
+                "source": source
+            }))
+            pending_ms = 0.0
+            flush_pending = False
+        else:
+            await ws.send_text(json.dumps({
+                "type": "commit_deferred",
+                "have_ms": round(pending_ms, 1),
+                "need_ms": round(max(0.0, MIN_COMMIT_MS - pending_ms), 1),
+                "source": source
+            }))
+            flush_pending = True
 
     async def connect_upstream():
         if not api_key:
@@ -361,9 +386,11 @@ async def ws_stream(ws: WebSocket):
             await upstream.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
+                    "input_audio_format": "pcm16",
+                    "sample_rate_hz": 16000,
                     "input_audio_transcription": {"model": "whisper-1", "language": "en"},
-                    "turn_detection": {"type": "server_vad", "threshold": 0.32, "prefix_padding_ms": 300, "silence_duration_ms": 350},
+                    "turn_detection": {"type": "server_vad", "threshold": 0.32,
+                                       "prefix_padding_ms": 300, "silence_duration_ms": 350},
                     "input_audio_noise_reduction": {"type": "near_field"},
                 },
             }))
@@ -371,12 +398,15 @@ async def ws_stream(ws: WebSocket):
             await ws.send_text(json.dumps({"type": "status", "upstream": "ok"}))
         except Exception as e:
             connect_err["exc"] = e
-            await ws.send_text(json.dumps({"type": "error", "detail": f"upstream_connect_failed: {type(e).__name__}: {str(e)}"}))
+            await ws.send_text(json.dumps({
+                "type": "error",
+                "detail": f"upstream_connect_failed: {type(e).__name__}: {str(e)}"
+            }))
 
     asyncio.create_task(connect_upstream())
 
     async def client_loop():
-        nonlocal pending_ms, flush_pending
+        nonlocal pending_ms, flush_pending, last_sr
         try:
             while True:
                 msg = await ws.receive_text()
@@ -393,50 +423,42 @@ async def ws_stream(ws: WebSocket):
                 elif t == "barge_in":
                     tts.generation += 1
                     tts.cancel()
-                    try: await ws.send_text(json.dumps({"type": "tts_stop"}))
-                    except: pass
+                    try:
+                        await ws.send_text(json.dumps({"type": "tts_stop"}))
+                    except Exception:
+                        pass
+                    # no commit here; just stop TTS immediately
 
                 elif t == "audio":
-                    # ACK locally
+                    # ACK to browser
                     try:
                         raw = base64.b64decode(data.get("audio_b64", ""))
                         await ws.send_text(json.dumps({"type": "ack", "kind": "audio", "bytes": len(raw)}))
                     except Exception:
                         await ws.send_text(json.dumps({"type": "ack", "kind": "audio", "bytes": 0}))
 
-                    # Forward to upstream
+                    # Forward audio upstream
                     if upstream_ref["conn"]:
                         await upstream_ref["conn"].send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": data.get("audio_b64", ""),
                         }))
-                        # track appended duration
-                        try:
-                            sr = int(data.get("sr") or 16000)
-                            frame_samples = int(data.get("frame_samples") or 0)
-                            if sr > 0 and frame_samples > 0:
-                                pending_ms += (frame_samples / sr) * 1000.0
-                                if flush_pending and pending_ms >= MIN_COMMIT_MS:
-                                    await upstream_ref["conn"].send(json.dumps({"type": "input_audio_buffer.commit"}))
-                                    pending_ms = 0.0
-                                    flush_pending = False
-                        except Exception:
-                            pass
+
+                    # ---- NEW: track uncommitted ms for commit gating ----
+                    sr = int(data.get("sr") or 16000)
+                    frame_samples = int(data.get("frame_samples") or 0)
+                    if sr > 0 and frame_samples > 0:
+                        last_sr = sr
+                        pending_ms += (1000.0 * frame_samples / sr)
+
+                    # If a flush was requested earlier, send commit once enough ms have accumulated
+                    if flush_pending and pending_ms >= MIN_COMMIT_MS:
+                        await send_commit_if_ready(source="deferred")
 
                 elif t == "flush":
-                    if upstream_ref["conn"]:
-                        if pending_ms >= MIN_COMMIT_MS:
-                            await upstream_ref["conn"].send(json.dumps({"type": "input_audio_buffer.commit"}))
-                            pending_ms = 0.0
-                            flush_pending = False
-                        else:
-                            flush_pending = True
-                            try:
-                                await ws.send_text(json.dumps({"type":"status","note":"flush_deferred","pending_ms":pending_ms}))
-                            except Exception:
-                                pass
+                    # Only commit if we have enough buffered; otherwise mark it pending
+                    await send_commit_if_ready(source="flush")
 
-                # ignore unknown types
         except WebSocketDisconnect:
             pass
         finally:
@@ -460,29 +482,30 @@ async def ws_stream(ws: WebSocket):
             et = evt.get("type")
 
             if et in ("error", "response.error"):
-                try: await ws.send_text(json.dumps({"type": "error", "detail": evt}))
-                except Exception: pass
+                try:
+                    await ws.send_text(json.dumps({"type": "error", "detail": evt}))
+                except Exception:
+                    pass
                 continue
 
             if et == "input_audio_buffer.speech_started":
-                # Server VAD barge-in: stop TTS now and invalidate in-flight chunks
+                # barge-in: stop TTS
                 tts.generation += 1
                 tts.cancel()
                 await ws.send_text(json.dumps({"type": "tts_stop"}))
                 await ws.send_text(json.dumps({"type": "event", "name": "speech_started"}))
-                # Reset gating (new turn)
-                pending_ms = 0.0
-                flush_pending = False
 
-            elif et in ("conversation.item.input_audio_transcription.delta","transcription.delta","response.audio_transcript.delta"):
+            elif et in ("conversation.item.input_audio_transcription.delta",
+                        "transcription.delta",
+                        "response.audio_transcript.delta"):
                 await ws.send_text(json.dumps({"type": "partial", "text": evt.get("delta", "")}))
 
-            elif et in ("conversation.item.input_audio_transcription.completed","transcription.completed"):
+            elif et in ("conversation.item.input_audio_transcription.completed",
+                        "transcription.completed"):
                 user_text = evt.get("transcript", "")
                 res = await determine_intent(ChatMessage(message=user_text))
                 reply = res.get("result", "")
-
-                # Start a *new* TTS generation for this reply
+                # new TTS generation for this reply
                 tts.cancel()
                 tts.reset()
                 tts.generation += 1
