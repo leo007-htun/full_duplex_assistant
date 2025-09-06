@@ -92,3 +92,15 @@ async def determine_intent(msg: ChatMessage):
         result = f"Intent: {intent}, GPT reply: {intent_data.get('response','')}"
 
     return {"intent": intent, "result": result}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "assistant.app:app",  # adjust to your module path if needed
+        host="0.0.0.0",
+        port=8000,
+        reload=True,          # useful for local development
+        proxy_headers=True,   # respect headers if behind a proxy
+        forwarded_allow_ips="*"
+    )
+
