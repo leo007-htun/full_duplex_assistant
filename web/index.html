@@ -234,22 +234,25 @@ async function start(){
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
       // live meter for confidence
       setMeter(rms(samples) * 1.8);
-
+    
       const i16 = f32ToI16(samples);
- 
-      ws.send(JSON.stringify({ 
-        type:"audio",
-        sr:16000,
-        channels:1,
-        frame_samples: samples.length,
-        audio_b64: toB64(new Uint8Array(i16.buffer)) 
-      })); 
-        if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
+    
+      try {
+        ws.send(JSON.stringify({ 
+          type: "audio",
+          sr: 16000,
+          channels: 1,
+          frame_samples: samples.length,
+          audio_b64: toB64(new Uint8Array(i16.buffer))
+        }));
+        if ((++framesSent % 10) === 0) {
+          log('[mic] frames sent:', framesSent, 'len:', samples.length);
+        }
       } catch (err) {
         console.error('WS send failed', err);
       }
     }
-  };
+
 
   // keep node in the graph but muted (prevents Chrome GC)
   micSink = audioCtx.createGain(); micSink.gain.value = 0;
