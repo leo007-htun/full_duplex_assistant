@@ -3,36 +3,53 @@
 <head>
   <meta charset="UTF-8">
   <title>OpenAI Voice Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
-  <h1>OpenAI Voice Assistant (STT + TTS + VAD)</h1>
-  <button id="startBtn">Start Assistant</button>
-  <p><strong>Transcript:</strong> <span id="transcript"></span></p>
-  <p><strong>Response:</strong> <span id="response"></span></p>
+<body class="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 min-h-screen flex items-center justify-center">
+
+  <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-lg text-center">
+    <h1 class="text-2xl font-bold text-gray-800 mb-6">🎤 OpenAI Voice Assistant</h1>
+
+    <button id="startBtn" 
+      class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-full transition duration-200 shadow-md">
+      Start Talking
+    </button>
+
+    <div class="mt-6 text-left">
+      <h2 class="text-lg font-semibold text-gray-700">Transcript</h2>
+      <p id="transcript" class="p-3 bg-gray-100 rounded-lg min-h-[50px] text-gray-800"></p>
+    </div>
+
+    <div class="mt-6 text-left">
+      <h2 class="text-lg font-semibold text-gray-700">Assistant</h2>
+      <p id="response" class="p-3 bg-indigo-50 rounded-lg min-h-[50px] text-gray-900"></p>
+    </div>
+  </div>
 
 <script type="module">
-import VAD from "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/index.js";
+import { MicVAD } from "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/index.js";
 
 let mediaRecorder;
 let audioChunks = [];
-let vad;
 let audioContext;
 let ttsAudio = null;
 
-// ⚠️ Replace with a backend that provides ephemeral OpenAI keys securely
-const OPENAI_API_KEY = "YOUR_API_KEY";  
+// ⚠️ IMPORTANT: never expose your real API key in frontend code.
+// Replace with an ephemeral key provided by your backend.
+const OPENAI_API_KEY = "YOUR_API_KEY";
 
 const transcriptEl = document.getElementById("transcript");
 const responseEl = document.getElementById("response");
+const startBtn = document.getElementById("startBtn");
 
 // --------------------
-// Setup VAD
+// VAD setup
 // --------------------
 async function setupVAD(stream) {
-  vad = await VAD.MicVAD.new({
+  const vad = await MicVAD.new({
     stream,
     onSpeechStart: () => {
-      console.log("Speech detected, stopping TTS...");
+      console.log("🎙️ User started talking, stopping TTS...");
       stopTTS();
     }
   });
@@ -40,7 +57,7 @@ async function setupVAD(stream) {
 }
 
 // --------------------
-// Speech Recording & Send to OpenAI
+// Recording Control
 // --------------------
 async function startRecording() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -60,20 +77,21 @@ async function startRecording() {
   };
 
   mediaRecorder.start();
-  console.log("Recording started...");
+  console.log("🎙️ Recording started...");
 }
 
 function stopRecording() {
   if (mediaRecorder && mediaRecorder.state !== "inactive") {
     mediaRecorder.stop();
-    console.log("Recording stopped.");
+    console.log("🛑 Recording stopped.");
   }
 }
 
 // --------------------
-// OpenAI STT + Response
+// Send to OpenAI (STT + Chat + TTS)
 // --------------------
 async function sendToOpenAI(audioBlob) {
+  // ---- Speech-to-Text
   const formData = new FormData();
   formData.append("file", audioBlob, "speech.webm");
   formData.append("model", "gpt-4o-transcribe");
@@ -90,7 +108,7 @@ async function sendToOpenAI(audioBlob) {
   const userText = sttData.text;
   transcriptEl.innerText = userText;
 
-  // Now send user text to GPT for intent/response
+  // ---- Chat Completion
   const chatResp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -107,12 +125,12 @@ async function sendToOpenAI(audioBlob) {
   const reply = chatData.choices[0].message.content;
   responseEl.innerText = reply;
 
-  // Play TTS
+  // ---- TTS
   await playTTS(reply);
 }
 
 // --------------------
-// OpenAI TTS
+// TTS
 // --------------------
 async function playTTS(text) {
   stopTTS(); // cancel any ongoing playback
@@ -142,18 +160,24 @@ function stopTTS() {
     ttsAudio.pause();
     ttsAudio.src = "";
     ttsAudio = null;
-    console.log("TTS stopped.");
+    console.log("🔇 TTS stopped.");
   }
 }
 
 // --------------------
 // Button Control
 // --------------------
-document.getElementById("startBtn").addEventListener("click", () => {
+startBtn.addEventListener("click", () => {
   if (!mediaRecorder || mediaRecorder.state === "inactive") {
     startRecording();
+    startBtn.innerText = "Stop Talking";
+    startBtn.classList.remove("bg-indigo-600");
+    startBtn.classList.add("bg-red-600", "hover:bg-red-700");
   } else {
     stopRecording();
+    startBtn.innerText = "Start Talking";
+    startBtn.classList.remove("bg-red-600", "hover:bg-red-700");
+    startBtn.classList.add("bg-indigo-600");
   }
 });
 </script>
