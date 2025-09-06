@@ -100,7 +100,7 @@ async function ensureTTSContext(sampleRateHint=24000){
   if (ttsCtx && ttsNode) return;
   ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
   try {
-    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js'); // your TTS worklet
+    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js');
   } catch (e) {
     console.error('Failed to load /pcm-player-processor.js', e);
     setStatus('Failed to load TTS worklet','error');
@@ -109,8 +109,16 @@ async function ensureTTSContext(sampleRateHint=24000){
   ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
   ttsNode.connect(ttsCtx.destination);
 }
-function ttsFlush(){ try { ttsNode?.port.postMessage({ type: 'flush' }); } catch {} }
-function ttsStop(){ try { ttsNode?.disconnect(); } catch {}; try { ttsCtx?.close(); } catch {}; ttsNode=null; ttsCtx=null; }
+function ttsFlush(){
+  try {
+    if (ttsNode && ttsNode.port) ttsNode.port.postMessage({ type: 'flush' });
+  } catch (e) {}
+}
+function ttsStop(){
+  try { if (ttsNode) ttsNode.disconnect(); } catch (e) {}
+  try { if (ttsCtx) ttsCtx.close(); } catch (e) {}
+  ttsNode=null; ttsCtx=null;
+}
 
 /* =========================
    WebSocket lifecycle
@@ -120,16 +128,16 @@ function attachWS(socket){
   socket.onopen = ()=>{
     setStatus("WebSocket connected ✔","ok");
     wsRetry=0;
-    pingTimer = setInterval(()=>{ 
+    pingTimer = setInterval(()=>{
       if(socket.readyState===WebSocket.OPEN) {
-        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch {}
+        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch (e) {}
       }
     }, 20000);
   };
   socket.onerror = (e)=>{ console.error("[WS] error", e); setStatus("WebSocket error","error"); };
   socket.onclose = (e)=>{
     console.warn("[WS] close", e.code, e.reason);
-    setStatus(`WebSocket closed (${e.code})`,"error");
+    setStatus("WebSocket closed ("+e.code+")","error");
     if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
     if (running) {
       const backoff = Math.min(1000 * Math.pow(2, wsRetry++), 10000);
@@ -142,14 +150,14 @@ function attachWS(socket){
     if(m.type==="partial"){ $('partial').textContent = m.text; }
     if(m.type==="final"){
       $('partial').textContent = "";
-      $('final').textContent = `You: ${m.text}\nAssistant: ${m.reply}`;
+      $('final').textContent = "You: " + m.text + "\nAssistant: " + m.reply;
     }
 
     // ====== TTS handling ======
     if(m.type==="tts_start"){
       ttsSrcRate = m.sample_rate || 24000;
       await ensureTTSContext(ttsSrcRate);
-      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch {} }
+      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch (e) {} }
       setStatus("Speaking…","speak");
     }
     if(m.type==="tts_chunk" && ttsNode){
@@ -166,7 +174,7 @@ function attachWS(socket){
 function connectWS(){ ws = new WebSocket(WS_URL); attachWS(ws); }
 
 /* =========================
-   Mic → AudioWorklet → WS  (no ScriptProcessor)
+   Mic → AudioWorklet → WS
 ========================= */
 async function start(){
   if(running) return; running=true;
@@ -189,7 +197,7 @@ async function start(){
   }
 
   // 2) Mic permission (mono + noise controls help VAD)
-  try { 
+  try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -197,7 +205,7 @@ async function start(){
         noiseSuppression: true,
         autoGainControl: true
       }
-    }); 
+    });
     log('Mic stream granted');
   }
   catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
@@ -205,10 +213,10 @@ async function start(){
   // 3) AudioContext and mic capture via Worklet
   audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
   log('AudioContext rate =', audioCtx.sampleRate);
-  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); }catch{} }
+  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch (e) {} }
 
   try {
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js'); // your mic worklet
+    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
   } catch (e) {
     console.error('Failed to load /mic-capture-processor.js', e);
     setStatus('Failed to load mic worklet','error');
@@ -220,7 +228,7 @@ async function start(){
     numberOfInputs: 1,
     numberOfOutputs: 1,
     outputChannelCount: [1],
-    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 }
+    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 } // 20ms -> 320 samples @16k
   });
 
   let framesSent = 0;
@@ -228,31 +236,28 @@ async function start(){
   micNodeLocal.port.onmessage = (e)=>{
     const { type, samples, rate } = e.data || {};
 
-    // optional debug message from worklet (if you add it there)
+    // optional debug message from worklet
     if (type === 'debug' && rate) { log('Worklet rate =', rate); return; }
 
     if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
       // live meter for confidence
       setMeter(rms(samples) * 1.8);
-    
+
       const i16 = f32ToI16(samples);
-    
       try {
-        ws.send(JSON.stringify({ 
+        ws.send(JSON.stringify({
           type: "audio",
           sr: 16000,
           channels: 1,
-          frame_samples: samples.length,
+          frame_samples: samples.length, // should be 320
           audio_b64: toB64(new Uint8Array(i16.buffer))
         }));
-        if ((++framesSent % 10) === 0) {
-          log('[mic] frames sent:', framesSent, 'len:', samples.length);
-        }
+        if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
       } catch (err) {
         console.error('WS send failed', err);
       }
     }
-
+  };
 
   // keep node in the graph but muted (prevents Chrome GC)
   micSink = audioCtx.createGain(); micSink.gain.value = 0;
@@ -266,12 +271,12 @@ async function start(){
 
 function stop(){
   running=false;
-  try{ ws && ws.readyState===WebSocket.OPEN && ws.send(JSON.stringify({type:"barge_in"})); }catch{}
-  try{ micNode && micNode.disconnect(); }catch{}
-  try{ micSink && micSink.disconnect(); }catch{}
-  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
-  try{ audioCtx && audioCtx.close(); }catch{}
-  try{ ws && ws.close(); }catch{}
+  try{ if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); }catch(e){}
+  try{ if (micNode) micNode.disconnect(); }catch(e){}
+  try{ if (micSink) micSink.disconnect(); }catch(e){}
+  try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  try{ if (audioCtx) audioCtx.close(); }catch(e){}
+  try{ if (ws) ws.close(); }catch(e){}
   if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
   ttsStop();
   micNode=null; micSink=null; stream=null; audioCtx=null;
@@ -288,12 +293,12 @@ $('echo').onclick = ()=>{
   t.onerror = (e)=>console.error('[ECHO] error', e);
   t.onclose = (e)=>console.warn('[ECHO] close', e.code, e.reason);
   t.onmessage=(e)=>console.log('[ECHO] msg', e.data);
-  setTimeout(()=>{ try{ t.readyState===WebSocket.OPEN && t.send('hello'); }catch{} }, 500);
+  setTimeout(()=>{ try{ if (t.readyState===WebSocket.OPEN) t.send('hello'); }catch(e){} }, 500);
 };
 
 $('start').onclick = start;
 $('stop').onclick  = stop;
-window.addEventListener('beforeunload', ()=>{ try{ ws && ws.close(); }catch{} });
+window.addEventListener('beforeunload', ()=>{ try{ if (ws) ws.close(); }catch(e){} });
 </script>
 </body>
 </html>
