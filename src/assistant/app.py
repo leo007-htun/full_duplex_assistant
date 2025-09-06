@@ -3,16 +3,15 @@ import json
 import os
 from typing import Dict, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from jinja2 import Environment, FileSystemLoader
 
-from .services.openai_client import client  # your OpenAI wrapper
+from .services.openai_client import client
 
-# -----------------------
+# ------------------------
 # Config
-# -----------------------
+# ------------------------
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
 
 app = FastAPI(title="Browser-First Voice Assistant")
@@ -26,9 +25,11 @@ app.add_middleware(
 
 conversation_history: List[Dict[str, str]] = []
 
-# -----------------------
+# ------------------------
 # Prompts
-# -----------------------
+# ------------------------
+from jinja2 import Environment, FileSystemLoader
+
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 _env = Environment(loader=FileSystemLoader(PROMPT_DIR))
 
@@ -41,16 +42,13 @@ def render_system_prompt(session_id: str = "SESSION-001") -> str:
     return _env.get_template("system_prompt.j2").render(session_id=session_id)
 
 
-# -----------------------
-# Chat message model
-# -----------------------
 class ChatMessage(BaseModel):
     message: str
 
 
-# -----------------------
-# GPT intent detection
-# -----------------------
+# ------------------------
+# Determine intent
+# ------------------------
 async def determine_intent_gpt(message: str) -> Dict[str, str]:
     prompt = render_intent_prompt()
     resp = await client.chat.completions.create(
@@ -65,18 +63,11 @@ async def determine_intent_gpt(message: str) -> Dict[str, str]:
     try:
         return json.loads(resp.choices[0].message.content)
     except Exception:
-        return {"intent": "unknown", "reason": "Could not parse GPT response."}
+        return {"intent": "unknown", "response": "Could not parse GPT response."}
 
 
-# -----------------------
-# REST: Determine Intent
-# -----------------------
-@app.post("/determine_intent")
+@app.post("/api/determine_intent")
 async def determine_intent(msg: ChatMessage):
-    """
-    GPT determines intent and routes to smalltalk, weather, etc.
-    Returns JSON only; browser handles TTS.
-    """
     global conversation_history
     user_text = msg.message
     intent_data = await determine_intent_gpt(user_text)
@@ -100,40 +91,8 @@ async def determine_intent(msg: ChatMessage):
         if len(conversation_history) > 40:
             conversation_history = conversation_history[-40:]
     elif intent == "weather":
-        # Example: simple route; replace with live weather logic
-        result = "Sunny, 25°C"
+        result = "The weather is sunny, 25°C."  # Replace with dynamic weather if needed
     else:
-        result = f"Intent: {intent}, GPT reply: {intent_data.get('response','')}"
+        result = intent_data.get("response", "Sorry, I didn't understand that.")
 
     return {"intent": intent, "result": result}
-
-
-# -----------------------
-# WebSocket (optional, for streaming updates to browser)
-# -----------------------
-@app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket):
-    await ws.accept()
-    try:
-        while True:
-            msg = await ws.receive_text()
-            try:
-                data = json.loads(msg)
-            except Exception:
-                continue
-
-            if data.get("type") == "user_text":
-                # Browser sends recognized text
-                user_text = data.get("text", "")
-                response = await determine_intent(ChatMessage(message=user_text))
-                await ws.send_text(json.dumps({
-                    "type": "gpt_response",
-                    "intent": response["intent"],
-                    "text": response["result"]
-                }))
-
-            elif data.get("type") == "ping":
-                await ws.send_text(json.dumps({"type": "pong"}))
-
-    except WebSocketDisconnect:
-        pass
