@@ -225,7 +225,9 @@ async def mic_stream_vad():
         await upstream.send(json.dumps({
             "type": "session.update",
             "session": {
-                "input_audio_format": {"type": "pcm16", "sample_rate_hz": RATE},
+                #"input_audio_format": {"type": "pcm16", "sample_rate_hz": RATE},
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": 16000,
                 "input_audio_transcription": {"model": "whisper-1", "language": "en"},
                 "turn_detection": {"type": "server_vad", "threshold": 0.32, "prefix_padding_ms": 300, "silence_duration_ms": 350},
                 "input_audio_noise_reduction": {"type": "near_field"},
