@@ -4,128 +4,99 @@
 <meta charset="UTF-8">
 <title>Realtime Voice Assistant</title>
 <style>
-body { font-family: sans-serif; background:#0b0e14; color:#e6edf3; display:flex; flex-direction:column; align-items:center; padding:20px; }
-h1 { margin-bottom:16px; }
-.card { background:#131721; padding:16px; border-radius:16px; width:90%; max-width:800px; margin-bottom:16px; }
-#controls { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
-button { padding:10px 16px; border:none; border-radius:12px; cursor:pointer; background:#76b3fa; color:#0a1020; font-weight:600; }
-button:disabled { opacity:0.5; cursor:not-allowed; }
-#output { background:#0f1320; border-radius:12px; padding:12px; min-height:200px; max-height:60vh; overflow:auto; white-space:pre-wrap; font-family:monospace; }
-.partial { color:#96a0b5; opacity:0.8; }
-.final { color:#e6edf3; opacity:0.95; }
+  body { font-family:sans-serif; padding:16px; background:#0b0e14; color:#e6edf3; }
+  button { margin:8px; padding:10px 16px; border-radius:8px; border:none; cursor:pointer; }
+  button.primary { background:#76b3fa; color:#0a1020; font-weight:bold; }
+  #output { border:1px solid #444; padding:12px; border-radius:8px; min-height:300px; overflow:auto; background:#131721; }
 </style>
 </head>
 <body>
 
 <h1>Realtime Voice Assistant</h1>
-
-<div class="card" id="controls">
-  <button id="startBtn">Start Listening</button>
-  <button id="stopBtn" disabled>Stop</button>
-  <label>Language:
-    <select id="language">
-      <option value="en-US">English</option>
-      <option value="hi-IN">Hindi</option>
-    </select>
-  </label>
-</div>
-
-<div class="card">
-  <div id="output">
-    <span class="final" id="finalText"></span>
-    <span class="partial" id="partialText"></span>
-  </div>
-</div>
+<button id="startBtn" class="primary">Start Listening</button>
+<button id="stopBtn" disabled>Stop</button>
+<div id="output"></div>
 
 <script>
-const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
-const languageSelect = document.getElementById("language");
-const partialSpan = document.getElementById("partialText");
-const finalSpan = document.getElementById("finalText");
-
 let recognition;
-let ttsAudio = null;
+let audioCtx, ttsSource;
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const output = document.getElementById('output');
 
-// ----------- STT -----------
+// -------------------- Web Speech Recognition --------------------
 function startRecognition() {
   recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
   recognition.continuous = true;
   recognition.interimResults = true;
-  recognition.lang = languageSelect.value;
+  recognition.lang = 'en-US';
 
   recognition.onresult = async (event) => {
-    let partial = "";
-    let finalTranscript = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const res = event.results[i];
-      if(res.isFinal) finalTranscript += res[0].transcript + " ";
-      else partial += res[0].transcript + " ";
+    let transcript = '';
+    for(let i=event.resultIndex;i<event.results.length;i++){
+      transcript += event.results[i][0].transcript;
     }
-    partialSpan.textContent = partial;
-    if(finalTranscript) {
-      finalSpan.textContent += finalTranscript;
-      partialSpan.textContent = "";
+    output.textContent = transcript;
 
-      // Stop TTS immediately if user starts talking (VAD)
-      if(ttsAudio && !ttsAudio.paused) {
-        ttsAudio.pause();
-        ttsAudio.currentTime = 0;
-      }
+    // Detect VAD: user is talking → stop TTS immediately
+    stopTTS();
 
-      // Send to backend for intent
-      const resp = await fetch(`https://com-cloud.cloud/determine_intent`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: finalTranscript.trim() })
+    // Send text to backend
+    try {
+      const resp = await fetch('/determine_intent', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({message: transcript})
       });
       const data = await resp.json();
-      if(data.result) playTTS(data.result);
+      playTTS(data.result);
+    } catch(e) {
+      console.error('Error fetching intent:', e);
     }
   };
 
-  recognition.onstart = () => startBtn.textContent = "Listening...";
-  recognition.onend = () => startBtn.textContent = "Start Listening";
-  recognition.onerror = (e) => console.error("STT error:", e);
+  recognition.onstart = () => { startBtn.textContent = 'Listening...'; };
+  recognition.onend = () => { startBtn.textContent = 'Start Listening'; };
+  recognition.onerror = (e) => { console.error(e); };
 
   recognition.start();
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
 }
 
 function stopRecognition() {
   if(recognition) recognition.stop();
-}
-
-// ----------- TTS -----------
-function playTTS(text) {
-  if(ttsAudio) {
-    ttsAudio.pause();
-    ttsAudio.currentTime = 0;
-  }
-  ttsAudio = new Audio(`https://com-cloud.cloud/tts?text=${encodeURIComponent(text)}&voice=nova`);
-  ttsAudio.play();
-}
-
-// ----------- UI -----------
-startBtn.addEventListener("click", () => {
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  startRecognition();
-});
-
-stopBtn.addEventListener("click", () => {
   startBtn.disabled = false;
   stopBtn.disabled = true;
-  stopRecognition();
-  if(ttsAudio) {
-    ttsAudio.pause();
-    ttsAudio.currentTime = 0;
+  stopTTS();
+}
+
+// -------------------- Web Audio TTS --------------------
+function playTTS(text) {
+  stopTTS();
+  if(!text) return;
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = 'en-US';
+
+  utterance.onstart = () => console.log('TTS started');
+  utterance.onend = () => console.log('TTS ended');
+
+  speechSynthesis.speak(utterance);
+  ttsSource = utterance;
+}
+
+function stopTTS() {
+  if(ttsSource) {
+    speechSynthesis.cancel();
+    ttsSource = null;
   }
-});
+}
 
-languageSelect.addEventListener("change", () => {
-  if(recognition) recognition.lang = languageSelect.value;
-});
+// -------------------- Button Events --------------------
+startBtn.onclick = startRecognition;
+stopBtn.onclick = stopRecognition;
 </script>
-
 </body>
 </html>
