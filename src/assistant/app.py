@@ -387,7 +387,7 @@ async def ws_stream(ws: WebSocket):
                 "type": "session.update",
                 "session": {
                     "input_audio_format": "pcm16",
-                    "sample_rate_hz": 16000,
+                    #"sample_rate_hz": 16000,
                     "input_audio_transcription": {"model": "whisper-1", "language": "en"},
                     "turn_detection": {"type": "server_vad", "threshold": 0.32,
                                        "prefix_padding_ms": 300, "silence_duration_ms": 350},
