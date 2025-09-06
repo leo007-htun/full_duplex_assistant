@@ -1,394 +1,131 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Realtime Voice</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:system-ui;margin:2rem;max-width:800px}
-    button{padding:.6rem 1rem;margin:.25rem .5rem .25rem 0}
-    pre{background:#f6f6f6;padding:1rem;border-radius:.5rem;white-space:pre-wrap}
-    .status{font-size:.95rem;margin:.5rem 0}
-    .ok{color:#0a7b22}
-    .error{color:#b00020}
-    .listen{color:#b00020;font-weight:bold}
-    .speak{color:#0066cc;font-weight:bold}
-    .muted{opacity:.6}
-    #meter{width:220px;height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:.4rem 0}
-    #bar{height:100%;width:0;background:#0a7b22;transition:width .05s linear}
-    #log{white-space:pre-wrap;background:#fafafa;border:1px solid #eee;border-radius:6px;padding:8px;max-height:220px;overflow:auto}
-  </style>
+<meta charset="UTF-8">
+<title>Realtime Voice Assistant</title>
+<style>
+body { font-family: sans-serif; background:#0b0e14; color:#e6edf3; display:flex; flex-direction:column; align-items:center; padding:20px; }
+h1 { margin-bottom:16px; }
+.card { background:#131721; padding:16px; border-radius:16px; width:90%; max-width:800px; margin-bottom:16px; }
+#controls { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+button { padding:10px 16px; border:none; border-radius:12px; cursor:pointer; background:#76b3fa; color:#0a1020; font-weight:600; }
+button:disabled { opacity:0.5; cursor:not-allowed; }
+#output { background:#0f1320; border-radius:12px; padding:12px; min-height:200px; max-height:60vh; overflow:auto; white-space:pre-wrap; font-family:monospace; }
+.partial { color:#96a0b5; opacity:0.8; }
+.final { color:#e6edf3; opacity:0.95; }
+</style>
 </head>
 <body>
-  <h1>Realtime Voice</h1>
-  <p>Click Start to grant mic access. Speak any time — TTS will stop instantly when you talk.</p>
 
-  <div>
-    <button id="start">🎙️ Start</button>
-    <button id="stop"  disabled>⏹️ Stop</button>
-    <button id="force" title="Force commit current turn" class="muted">🚀 Force Send</button>
-    <button id="echo"  class="muted" title="Quick WS routing test">🔎 Test Echo</button>
+<h1>Realtime Voice Assistant</h1>
+
+<div class="card" id="controls">
+  <button id="startBtn">Start Listening</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <label>Language:
+    <select id="language">
+      <option value="en-US">English</option>
+      <option value="hi-IN">Hindi</option>
+    </select>
+  </label>
+</div>
+
+<div class="card">
+  <div id="output">
+    <span class="final" id="finalText"></span>
+    <span class="partial" id="partialText"></span>
   </div>
-
-  <div class="status" id="status">Idle</div>
-  <div id="meter"><div id="bar"></div></div>
-
-  <p><strong>Partial:</strong> <span id="partial"></span></p>
-  <pre id="final"></pre>
-
-  <h3>Logs</h3>
-  <pre id="log"></pre>
+</div>
 
 <script>
-/* =========================
-   URLs & globals
-========================= */
-const WS_PATH  = '/ws/stream';
-const ECHO_PATH= '/ws/echo';
-const WS_URL   = (location.protocol==='https:'?'wss://':'ws://') + location.host + WS_PATH;
-const ECHO_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host + ECHO_PATH;
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const languageSelect = document.getElementById("language");
+const partialSpan = document.getElementById("partialText");
+const finalSpan = document.getElementById("finalText");
 
-let ws, wsRetry=0, pingTimer=null;
-let audioCtx=null, stream=null, running=false;
-let micNode=null, micSink=null;
+let recognition;
+let ttsAudio = null;
 
-// ==== TTS (AudioWorklet) ====
-let ttsCtx=null, ttsNode=null, ttsSrcRate=24000;
+// ----------- STT -----------
+function startRecognition() {
+  recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = languageSelect.value;
 
-/* =========================
-   Helpers
-========================= */
-const $ = id => document.getElementById(id);
-const log = (...a)=>{ try{ console.log(...a); }catch(e){}; const el=$('log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
-
-function setStatus(text, cls=""){ const el=$('status'); el.textContent=text; el.className="status "+cls; }
-
-// base64 PCM16LE -> Float32 [-1,1]
-function base64ToFloat32(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const view = new DataView(bytes.buffer);
-  const out = new Float32Array(bytes.byteLength / 2);
-  for (let i = 0, j = 0; i < bytes.byteLength; i += 2, j++) {
-    const s = view.getInt16(i, true);
-    out[j] = s / 32768;
-  }
-  return out;
-}
-function resampleLinear(f32, srcRate, dstRate){
-  if (srcRate === dstRate) return f32;
-  const ratio = dstRate / srcRate;
-  const out = new Float32Array(Math.floor(f32.length * ratio));
-  let pos = 0;
-  for (let i = 0; i < out.length; i++) {
-    const idx = pos | 0, frac = pos - idx;
-    const a = f32[idx] || 0, b = f32[idx+1] || a;
-    out[i] = a + (b - a) * frac;
-    pos += 1 / ratio;
-  }
-  return out;
-}
-function toB64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
-function f32ToI16(f){ const o=new Int16Array(f.length); for(let i=0;i<f.length;i++){ let s=Math.max(-1,Math.min(1,f[i])); o[i]=s<0? Math.round(s*0x8000) : Math.round(s*0x7FFF); } return o; }
-function setMeter(level01){ $('bar').style.width = Math.min(1,Math.max(0,level01))*220 + 'px'; }
-function rms(samples){ let s=0; for(let i=0;i<samples.length;i++){ const v=samples[i]; s+=v*v; } return Math.sqrt(s/Math.max(1,samples.length)); }
-
-/* =========================
-   TTS via AudioWorkletNode
-========================= */
-async function ensureTTSContext(sampleRateHint=24000){
-  if (ttsCtx && ttsNode) return;
-  ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRateHint });
-  try {
-    await ttsCtx.audioWorklet.addModule('/pcm-player-processor.js');
-  } catch (e) {
-    console.error('Failed to load /pcm-player-processor.js', e);
-    setStatus('Failed to load TTS worklet','error');
-    throw e;
-  }
-  ttsNode = new AudioWorkletNode(ttsCtx, 'pcm-player');
-  ttsNode.connect(ttsCtx.destination);
-}
-function ttsFlush(){
-  try {
-    if (ttsNode && ttsNode.port) ttsNode.port.postMessage({ type: 'flush' });
-  } catch (e) {}
-}
-function ttsStop(){
-  try { if (ttsNode) ttsNode.disconnect(); } catch (e) {}
-  try { if (ttsCtx) ttsCtx.close(); } catch (e) {}
-  ttsNode=null; ttsCtx=null;
-}
-
-/* =========================
-   Partial/final logic + VAD fallbacks
-========================= */
-const VAD_THRESHOLD     = 0.012;  // adjust 0.008–0.02 for room noise
-const VAD_SILENCE_MS    = 700;    // flush after this much silence
-const FINAL_FALLBACK_MS = 1400;   // if no 'final' after last partial
-const NO_VAD_MAX_MS     = 1800;   // speech energy but no partials → flush
-
-let partialBuf = "";
-let lastPartialAt = 0;
-let lastEnergyAt  = 0;
-
-let finalFallbackTimer = null;
-let noVadTimer        = null;
-let wasSpeaking       = false;
-let silenceMs         = 0;
-let lastFrameT        = performance.now();
-
-/* =========================
-   WebSocket lifecycle
-========================= */
-function attachWS(socket){
-  log("WS_URL =", WS_URL);
-  socket.onopen = ()=>{
-    setStatus("WebSocket connected ✔","ok");
-    wsRetry=0;
-    pingTimer = setInterval(()=>{
-      if(socket.readyState===WebSocket.OPEN) {
-        try { socket.send(JSON.stringify({type:"ping", t:Date.now()})); } catch (e) {}
-      }
-    }, 20000);
-  };
-  socket.onerror = (e)=>{ console.error("[WS] error", e); setStatus("WebSocket error","error"); };
-  socket.onclose = (e)=>{
-    console.warn("[WS] close", e.code, e.reason);
-    setStatus("WebSocket closed ("+e.code+")","error");
-    if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
-    if (running) {
-      const backoff = Math.min(1000 * Math.pow(2, wsRetry++), 10000);
-      setTimeout(() => { connectWS(); }, backoff);
+  recognition.onresult = async (event) => {
+    let partial = "";
+    let finalTranscript = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      if(res.isFinal) finalTranscript += res[0].transcript + " ";
+      else partial += res[0].transcript + " ";
     }
-  };
-  socket.onmessage = async (evt)=>{
-    const m = JSON.parse(evt.data);
+    partialSpan.textContent = partial;
+    if(finalTranscript) {
+      finalSpan.textContent += finalTranscript;
+      partialSpan.textContent = "";
 
-    // debug/ack/error/status
-    if (m.type === "ack") log("ACK:", m.kind, m.bytes+"B");
-    if (m.type === "error") log("UPSTREAM ERROR:", JSON.stringify(m.detail));
-    if (m.type === "status") log("Upstream:", m.upstream);
-
-    // ---- speech lifecycle events ----
-    if (m.type === "event" && m.name === "speech_started") {
-      partialBuf = "";
-      $('partial').textContent = "";
-      if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
-      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
-    }
-
-    // ---- accumulate partials (append, don't overwrite) ----
-    if (m.type === "partial") {
-      partialBuf += m.text || "";
-      $('partial').textContent = partialBuf;
-      lastPartialAt = performance.now();
-      // auto-finalize if no final soon
-      if (finalFallbackTimer) clearTimeout(finalFallbackTimer);
-      finalFallbackTimer = setTimeout(()=>{
-        try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
-      }, FINAL_FALLBACK_MS);
-    }
-
-    // ---- final ----
-    if (m.type === "final") {
-      $('partial').textContent = "";
-      const you = m.text && m.text.length ? m.text : partialBuf;
-      $('final').textContent = "You: " + (you || "") + "\nAssistant: " + (m.reply || "");
-      partialBuf = "";
-      if (finalFallbackTimer) { clearTimeout(finalFallbackTimer); finalFallbackTimer=null; }
-      if (noVadTimer) { clearTimeout(noVadTimer); noVadTimer=null; }
-      setStatus("Listening…","listen");
-    }
-
-    // ====== TTS handling ======
-    if(m.type==="tts_start"){
-      ttsSrcRate = m.sample_rate || 24000;
-      await ensureTTSContext(ttsSrcRate);
-      if (ttsCtx.state === 'suspended') { try { await ttsCtx.resume(); } catch (e) {} }
-      setStatus("Speaking…","speak");
-    }
-    if(m.type==="tts_chunk" && ttsNode){
-      const f32src = base64ToFloat32(m.pcm_b64);
-      const f32out = resampleLinear(f32src, ttsSrcRate, ttsCtx.sampleRate);
-      ttsNode.port.postMessage({ type: 'audio', samples: f32out }, [f32out.buffer]);
-    }
-    if(m.type==="tts_end"){ ttsFlush(); setStatus("Listening…","listen"); }
-    if(m.type==="tts_stop" || (m.type==="event" && m.name==="speech_started")){
-      ttsFlush(); setStatus("Listening…","listen");
-    }
-  };
-}
-function connectWS(){ ws = new WebSocket(WS_URL); attachWS(ws); }
-
-/* =========================
-   Mic → AudioWorklet → WS
-========================= */
-async function start(){
-  if(running) return; running=true;
-  setStatus("Connecting…");
-
-  // 1) Ensure WS is open
-  connectWS();
-  try{
-    await new Promise((res,rej)=>{
-      if (ws.readyState===WebSocket.OPEN) return res();
-      const t=setTimeout(()=>{ cleanup(); rej(new Error("WS open timeout")); }, 10000);
-      const onOpen=()=>{ cleanup(); res(); };
-      const onErr =(e)=>{ cleanup(); rej(e); };
-      const onCls =(e)=>{ cleanup(); rej(e); };
-      function cleanup(){ clearTimeout(t); ws.removeEventListener('open',onOpen); ws.removeEventListener('error',onErr); ws.removeEventListener('close',onCls); }
-      ws.addEventListener('open',onOpen); ws.addEventListener('error',onErr); ws.addEventListener('close',onCls);
-    });
-  } catch (e) {
-    setStatus("WS failed to open","error"); running=false; return;
-  }
-
-  // 2) Mic permission (mono + noise controls help VAD)
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    });
-    log('Mic stream granted');
-  }
-  catch (e) { console.error(e); setStatus("Mic permission denied","error"); running=false; return; }
-
-  // 3) AudioContext and mic capture via Worklet
-  audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate:48000 });
-  log('AudioContext rate =', audioCtx.sampleRate);
-  if (audioCtx.state==='suspended') { try{ await audioCtx.resume(); } catch (e) {} }
-
-  try {
-    // use versioned v2 worklet (avoids caching old code)
-    await audioCtx.audioWorklet.addModule('/mic-capture-processor.js');
-  } catch (e) {
-    console.error('Failed to load /mic-capture-processor.js', e);
-    setStatus('Failed to load mic worklet','error');
-    running=false; return;
-  }
-
-  const srcNode = audioCtx.createMediaStreamSource(stream);
-  const micNodeLocal = new AudioWorkletNode(audioCtx, 'mic-capture-v2', {
-    numberOfInputs: 1,
-    numberOfOutputs: 1,
-    outputChannelCount: [1],
-    processorOptions: { downsampleTo: 16000, postIntervalMs: 20 } // 20ms -> 320 samples @16k
-  });
-
-  let framesSent = 0;
-
-  micNodeLocal.port.onmessage = (e)=>{
-    const { type, samples, rate, frame_len } = e.data || {};
-
-    if (type === 'debug') {
-      if (rate) log('Worklet rate =', rate, 'frame_len =', frame_len);
-      return;
-    }
-
-    if (type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
-      // level + meter
-      const level = rms(samples);
-      setMeter(level * 1.8);
-
-      // --- silence/speech tracking ---
-      const now = performance.now();
-      const dt  = Math.max(0, now - lastFrameT);
-      lastFrameT = now;
-
-      if (level > VAD_THRESHOLD) {
-        // speech detected
-        if (!wasSpeaking) {
-          // just started: arm a "no-VAD" fallback timer
-          if (noVadTimer) clearTimeout(noVadTimer);
-          noVadTimer = setTimeout(()=>{
-            try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
-          }, NO_VAD_MAX_MS);
-        }
-        wasSpeaking = true;
-        silenceMs = 0;
-        lastEnergyAt = now;
-      } else if (wasSpeaking) {
-        silenceMs += dt;
-        if (silenceMs >= VAD_SILENCE_MS) {
-          // quiet long enough → ask server to finalize
-          try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
-          wasSpeaking = false;
-          silenceMs = 0;
-        }
+      // Stop TTS immediately if user starts talking (VAD)
+      if(ttsAudio && !ttsAudio.paused) {
+        ttsAudio.pause();
+        ttsAudio.currentTime = 0;
       }
 
-      // --- send the audio frame ---
-      const i16 = f32ToI16(samples);
-      try {
-        ws.send(JSON.stringify({
-          type: "audio",
-          sr: 16000,
-          channels: 1,
-          frame_samples: samples.length, // should be 320
-          audio_b64: toB64(new Uint8Array(i16.buffer))
-        }));
-        if ((++framesSent % 10) === 0) log('[mic] frames sent:', framesSent, 'len:', samples.length);
-      } catch (err) {
-        console.error('WS send failed', err);
-      }
+      // Send to backend for intent
+      const resp = await fetch(`https://com-cloud.cloud/determine_intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: finalTranscript.trim() })
+      });
+      const data = await resp.json();
+      if(data.result) playTTS(data.result);
     }
   };
 
-  // keep node in the graph but muted (prevents Chrome GC)
-  micSink = audioCtx.createGain(); micSink.gain.value = 0;
-  srcNode.connect(micNodeLocal); micNodeLocal.connect(micSink); micSink.connect(audioCtx.destination);
+  recognition.onstart = () => startBtn.textContent = "Listening...";
+  recognition.onend = () => startBtn.textContent = "Start Listening";
+  recognition.onerror = (e) => console.error("STT error:", e);
 
-  micNode = micNodeLocal;
-
-  $('start').disabled = true; $('stop').disabled = false;
-  setStatus("Listening…","listen");
+  recognition.start();
 }
 
-async function stop(){
-  running=false;
-
-  // finalize anything pending
-  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"flush"})); } catch (e) {}
-  try { if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"barge_in"})); } catch (e) {}
-
-  // give a brief window for 'final' to arrive
-  try { await new Promise(r => setTimeout(r, 200)); } catch (e) {}
-
-  try{ if (micNode) micNode.disconnect(); }catch(e){}
-  try{ if (micSink) micSink.disconnect(); }catch(e){}
-  try{ if (stream) stream.getTracks().forEach(t=>t.stop()); }catch(e){}
-  try{ if (audioCtx) audioCtx.close(); }catch(e){}
-  try{ if (ws) ws.close(); }catch(e){}
-  if (pingTimer) { clearInterval(pingTimer); pingTimer=null; }
-  ttsStop();
-  micNode=null; micSink=null; stream=null; audioCtx=null;
-  $('start').disabled = false; $('stop').disabled = true;
-  setStatus("Stopped.");
+function stopRecognition() {
+  if(recognition) recognition.stop();
 }
 
-/* =========================
-   Quick WS echo test
-========================= */
-$('echo').onclick = ()=>{
-  const t = new WebSocket(ECHO_URL);
-  t.onopen  = ()=>console.log('[ECHO] open');
-  t.onerror = (e)=>console.error('[ECHO] error', e);
-  t.onclose = (e)=>console.warn('[ECHO] close', e.code, e.reason);
-  t.onmessage=(e)=>console.log('[ECHO] msg', e.data);
-  setTimeout(()=>{ try{ if (t.readyState===WebSocket.OPEN) t.send('hello'); }catch(e){} }, 500);
-};
+// ----------- TTS -----------
+function playTTS(text) {
+  if(ttsAudio) {
+    ttsAudio.pause();
+    ttsAudio.currentTime = 0;
+  }
+  ttsAudio = new Audio(`https://com-cloud.cloud/tts?text=${encodeURIComponent(text)}&voice=nova`);
+  ttsAudio.play();
+}
 
-$('force').onclick = ()=>{ try{ if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'flush'})); }catch(e){} };
+// ----------- UI -----------
+startBtn.addEventListener("click", () => {
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  startRecognition();
+});
 
-$('start').onclick = start;
-$('stop').onclick  = stop;
-window.addEventListener('beforeunload', ()=>{ try{ if (ws) ws.close(); }catch(e){} });
+stopBtn.addEventListener("click", () => {
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  stopRecognition();
+  if(ttsAudio) {
+    ttsAudio.pause();
+    ttsAudio.currentTime = 0;
+  }
+});
+
+languageSelect.addEventListener("change", () => {
+  if(recognition) recognition.lang = languageSelect.value;
+});
 </script>
+
 </body>
 </html>
