@@ -378,6 +378,14 @@ async def startup_event():
 
 # Mount /api router
 app.include_router(api)
+# Expose the same endpoints without the /api prefix (so both paths work)
+app.add_api_route("/healthz", healthz, methods=["GET"])
+app.add_api_route("/weather", get_weather, methods=["GET"])
+app.add_api_route("/determine_intent", determine_intent, methods=["POST"])
+app.add_api_route("/transcribe", transcribe_audio, methods=["POST"])
+app.add_api_route("/tts", tts_mp3, methods=["POST"])
+app.add_api_route("/tts/stop", stop_tts, methods=["POST"])
+
 
 # Dev entrypoint
 if __name__ == "__main__":
