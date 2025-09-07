@@ -65,7 +65,7 @@ services:
       rm -rf /var/lib/apt/lists/* &&
       pip install --no-cache-dir
       fastapi 'uvicorn[standard]' pydantic jinja2 python-multipart openai websockets python-dotenv playwright &&
-      python -m playwright install --with-deps &&
+      (python -m playwright install --with-deps || true) &&
       python -m uvicorn assistant.app:app
       --host 0.0.0.0
       --port 8000
@@ -74,12 +74,18 @@ services:
     volumes:
       - ./src:/app
     env_file:
-      - ./src/assistant/.env
+      - ./src/assistant/.env    # must contain OPENAI_API_KEY=...
     environment:
       - ENABLE_VOICE=0
       - ALLOWED_ORIGINS=https://com-cloud.cloud
     expose:
       - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).status==200 else sys.exit(1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=full_duplex_web"
