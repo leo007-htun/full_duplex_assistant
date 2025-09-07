@@ -57,11 +57,20 @@ services:
     image: python:3.11-slim
     working_dir: /app
     command: >
-      uvicorn assistant.app:app
+      sh -lc "pip install --no-cache-dir
+      fastapi
+      'uvicorn[standard]'
+      pydantic
+      jinja2
+      python-multipart
+      openai
+      websockets
+      &&
+      python -m uvicorn assistant.app:app
       --host 0.0.0.0
       --port 8000
       --proxy-headers
-      --forwarded-allow-ips=*
+      --forwarded-allow-ips=*"
     volumes:
       - ./src:/app
     env_file:
