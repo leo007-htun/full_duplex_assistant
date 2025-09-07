@@ -1,12 +1,54 @@
-const API_BASE = location.origin;
-
-// UI
+// ====== Dynamic API base + prefix detection ======
+const ORIGIN = location.origin;
+let API_PREFIX = '/api'; // default; we'll verify and auto-fix
 const statusEl = document.getElementById('status');
 const apiEl = document.getElementById('api');
+
+// Small fetch helper with timeout + JSON fallback
+async function fetchJSON(url, opts = {}, timeoutMs = 5000) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    let body;
+    try { body = await r.clone().json(); } catch { body = await r.text(); }
+    return { ok: r.ok, status: r.status, body };
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// Try /api/healthz then /healthz; remember which works
+async function detectApiPrefix() {
+  for (const prefix of ['/api', '']) {
+    const url = `${ORIGIN}${prefix}/healthz`;
+    try {
+      const { ok, body } = await fetchJSON(url, {}, 3000);
+      if (ok && (body?.ok === true || body === '{"ok": true}' || body?.includes?.('"ok":'))) {
+        return prefix;
+      }
+    } catch { /* try next */ }
+  }
+  return '/api'; // fallback
+}
+
+(async () => {
+  API_PREFIX = await detectApiPrefix();
+  apiEl.textContent = API_PREFIX || '/';
+  try {
+    const { ok } = await fetchJSON(`${ORIGIN}${API_PREFIX}/healthz`, {}, 3000);
+    statusEl.textContent = ok ? 'Online' : 'Degraded';
+    statusEl.className = ok ? 'ok' : 'warn';
+  } catch {
+    statusEl.textContent = 'Offline';
+    statusEl.className = 'bad';
+  }
+})();
+// ====== UI refs ======
 const micState = document.getElementById('micState');
 const vadState = document.getElementById('vadState');
-const startBtn = document.getElementById('start');
-const stopBtn  = document.getElementById('stop');
+const startBtn  = document.getElementById('start');
+const stopBtn   = document.getElementById('stop');
 const transcriptEl = document.getElementById('transcript');
 const ttsTextEl = document.getElementById('ttsText');
 const voiceEl = document.getElementById('voice');
@@ -19,41 +61,25 @@ const level = document.getElementById('level');
 const mimeSel = document.getElementById('mime');
 const toastEl = document.getElementById('toast');
 
-apiEl.textContent = '/api';
-
-// toast
+// ====== Toast / Log ======
 let toastTimer;
-function toast(msg, cls=''){ clearTimeout(toastTimer); toastEl.textContent = msg; toastEl.className = `toast show ${cls}`; toastTimer = setTimeout(()=>toastEl.className='toast', 2400); }
-// log
+function toast(msg, cls=''){ clearTimeout(toastTimer); toastEl.textContent = msg; toastEl.className = `toast show ${cls}`; toastTimer=setTimeout(()=>toastEl.className='toast',2400); }
 function log(...a){ console.log(...a); logEl.textContent += a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')+'\n'; logEl.scrollTop = logEl.scrollHeight; }
-
-// health
-(async () => {
-  try { const r = await fetch(`${API_BASE}/api/healthz`); const j = await r.json(); statusEl.textContent = j?.ok?'Online':'Degraded'; statusEl.className = j?.ok?'ok':'warn'; }
-  catch { statusEl.textContent = 'Offline'; statusEl.className = 'bad'; }
-})();
-
-// ======== VAD params ========
-const VAD_THRESHOLD = 0.02;     // RMS threshold (~ energy)
-const VAD_HANGOVER_MS = 350;    // wait this long of silence before end-of-speech
-const FRAME_MS = 20;            // ~20ms analysis
+// ====== VAD params ======
+let VAD_THRESHOLD = 0.02;     // base RMS
+const VAD_HANGOVER_MS = 350;  // silence to end speech
 let vadSpeaking = false;
 let vadSilenceSince = 0;
+let noiseFloor = 0.01;        // adaptive noise floor
 
-// audio / analyser
+// ====== Audio state ======
 let ctx, analyser, source, rafId;
 let stream, recorder, chunks = [], recording = false;
 let recStartTime = 0;
 
-// TTS control
+// ====== TTS control ======
 let ttsAbort;        // AbortController for in-flight TTS fetch
 let ttsBlobURL = ''; // for cleanup
-
-function rms(samples) {
-  let sum = 0; for (let i=0;i<samples.length;i++){ const s = samples[i]/32768; sum += s*s; }
-  return Math.sqrt(sum / samples.length);
-}
-
 function drawScope() {
   const c = scope.getContext('2d');
   const w = scope.width = scope.clientWidth;
@@ -62,64 +88,69 @@ function drawScope() {
   const data = new Uint8Array(analyser.fftSize);
   analyser.getByteTimeDomainData(data);
 
-  // compute level from 8-bit PCM -> convert to 16-bit-like range for our rms()
-  let peak = 0, sum = 0;
+  // energy 0..1
+  let sum = 0, peak = 0;
   for (let i=0;i<data.length;i++){
     const v = (data[i]-128)/128;
     sum += v*v;
-    peak = Math.max(peak, Math.abs(v));
+    if (Math.abs(v) > peak) peak = Math.abs(v);
   }
-  const energy = Math.sqrt(sum/data.length);     // 0..1
+  const energy = Math.sqrt(sum/data.length);
   level.style.width = `${Math.min(100, Math.round(energy*100))}%`;
 
+  // draw
   c.clearRect(0,0,w,h);
   c.lineWidth = 2; c.strokeStyle = 'rgba(76,201,240,.9)'; c.beginPath();
   const slice = w / data.length;
   for (let i=0;i<data.length;i++){
-    const x = i * slice; const y = (data[i]/255)*h;
+    const x = i * slice, y = (data[i]/255)*h;
     if (i===0) c.moveTo(x,y); else c.lineTo(x,y);
   }
   c.stroke();
 
-  // VAD decision
+  // adaptive floor (slow follow)
+  noiseFloor = 0.98*noiseFloor + 0.02*energy;
+  const dynThresh = Math.max(VAD_THRESHOLD, noiseFloor * 2.25);
+
+  // VAD
   const now = performance.now();
-  if (energy >= VAD_THRESHOLD) {
-    // user speaking (transition if needed)
+  if (energy >= dynThresh) {
     if (!vadSpeaking) onSpeechStart();
     vadSpeaking = true;
     vadSilenceSince = 0;
-  } else {
-    // silence
-    if (vadSpeaking) {
-      if (!vadSilenceSince) vadSilenceSince = now;
-      if (now - vadSilenceSince > VAD_HANGOVER_MS) {
-        onSpeechEnd();
-        vadSpeaking = false;
-        vadSilenceSince = 0;
-      }
+  } else if (vadSpeaking) {
+    if (!vadSilenceSince) vadSilenceSince = now;
+    if (now - vadSilenceSince > VAD_HANGOVER_MS) {
+      onSpeechEnd();
+      vadSpeaking = false;
+      vadSilenceSince = 0;
     }
   }
 
   rafId = requestAnimationFrame(drawScope);
 }
-
 async function onSpeechStart(){
   vadState.textContent = 'speaking';
   vadState.className = 'ok';
   micState.textContent = recording ? 'recording' : 'armed';
 
-  // 💥 HARD-STOP any TTS instantly
+  // HARD-STOP any TTS instantly (local + server)
   stopTTSLocal();
-  try { await fetch(`${API_BASE}/api/tts/stop`, { method:'POST' }); } catch {}
+  try { await fetch(`${ORIGIN}${API_PREFIX}/tts/stop`, { method:'POST' }); } catch {}
 
-  // if we are not already recording, start a MediaRecorder session
+  // Start recorder if not already recording
   if (!recording) {
     chunks = [];
-    const mimeType = mimeSel.value;
-    recorder = new MediaRecorder(stream, { mimeType });
+    const mimeType = chooseMime();
+    try {
+      recorder = new MediaRecorder(stream, { mimeType });
+    } catch (e) {
+      log('MediaRecorder init failed, retrying with default:', e?.message || e);
+      recorder = new MediaRecorder(stream);
+    }
     recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-    recorder.onstop = () => { if (chunks.length) uploadChunk(mimeType); };
-    recorder.start(100); // gather small chunks
+    recorder.onstop = () => { if (chunks.length) uploadChunk(recorder.mimeType || mimeType); };
+    recorder.start(100);
     recording = true;
     recStartTime = performance.now();
   }
@@ -128,21 +159,38 @@ async function onSpeechStart(){
 function onSpeechEnd(){
   vadState.textContent = 'silence';
   vadState.className = 'muted';
-
   if (recording && recorder && recorder.state !== 'inactive') {
     recorder.stop();
     recording = false;
   }
 }
+function chooseMime() {
+  // Progressive MIME fallback for widest browser support
+  const prefs = [
+    mimeSel?.value,
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',           // iOS Safari
+    'audio/mpeg'           // mp3 (last resort; often not supported for MediaRecorder)
+  ].filter(Boolean);
+
+  for (const m of prefs) {
+    if (MediaRecorder.isTypeSupported?.(m)) return m;
+  }
+  return ''; // let browser pick
+}
 
 async function uploadChunk(mimeType){
   try{
-    const blob = new Blob(chunks, { type: mimeType });
+    const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+    chunks = []; // free memory early
     if (!blob.size) return;
-    const fd = new FormData();
-    fd.append('file', blob, `input.${mimeType.split('/')[1] || 'webm'}`);
+    const ext = (mimeType?.split?.('/')[1] || 'webm').split(';')[0] || 'webm';
 
-    const r = await fetch(`${API_BASE}/api/transcribe`, { method:'POST', body: fd });
+    const fd = new FormData();
+    fd.append('file', blob, `input.${ext}`);
+
+    const r = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
     if (!r.ok) {
       let d = await r.text(); try{ d = JSON.stringify(JSON.parse(d)) }catch{}
       throw new Error(`${r.status} ${r.statusText} ${d}`);
@@ -151,19 +199,17 @@ async function uploadChunk(mimeType){
     const text = data.text || '';
     transcriptEl.textContent = text;
 
-    // OPTIONAL: route it to your intent pipeline
-    // await fetch(`${API_BASE}/api/determine_intent`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message:text})});
-
+    // OPTIONAL: send to your intent router
+    // await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message:text})});
   }catch(e){
     log('Transcribe failed:', e?.message || e);
     toast('Transcribe failed', 'bad');
   }
 }
-
-// start / stop mic
+// ====== Mic start / stop ======
 async function start(){
   try{
-    stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ noiseSuppression:true, echoCancellation:true } });
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     source = ctx.createMediaStreamSource(stream);
     analyser = ctx.createAnalyser();
@@ -173,9 +219,11 @@ async function start(){
     drawScope();
     startBtn.disabled = true; stopBtn.disabled = false;
     micState.textContent = 'armed';
+    vadState.textContent = 'ready'; vadState.className = 'muted';
     toast('Mic ready. Start speaking…','ok');
   }catch(e){
     toast('Microphone blocked', 'bad');
+    log('getUserMedia error:', e?.message || e);
   }
 }
 
@@ -184,14 +232,13 @@ function stop(){
     cancelAnimationFrame(rafId);
     if (recorder && recorder.state !== 'inactive') recorder.stop();
     if (stream) stream.getTracks().forEach(t=>t.stop());
-    if (ctx) ctx.close();
+    if (ctx && ctx.state !== 'closed') ctx.close();
   }catch{}
   startBtn.disabled = false; stopBtn.disabled = true;
   micState.textContent = 'idle';
   vadState.textContent = 'ready'; vadState.className = 'muted';
 }
-
-// TTS: speak, but abort on user speech
+// ====== TTS: speak, but abort on user speech ======
 async function speak(){
   const text = ttsTextEl.value.trim();
   const voice = voiceEl.value || 'alloy';
@@ -201,7 +248,7 @@ async function speak(){
   ttsAbort = new AbortController();
 
   try{
-    const resp = await fetch(`${API_BASE}/api/tts`, {
+    const resp = await fetch(`${ORIGIN}${API_PREFIX}/tts`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ text, voice }),
       signal: ttsAbort.signal
@@ -221,20 +268,16 @@ async function speak(){
     player.pause();
     player.src = ttsBlobURL;
     player.load();
-    try { await player.play(); } catch { /* autoplay */ }
+    try { await player.play(); } catch {} // autoplay policies
     toast('Speaking…','ok');
   }catch(e){
-    if (e.name === 'AbortError') {
-      // expected on VAD start
-      return;
-    }
+    if (e.name === 'AbortError') return; // expected on VAD start
     log('TTS error:', e?.message || e);
     toast('TTS failed','bad');
   }
 }
 
 function stopTTSLocal(){
-  // stop audio element & abort in-flight fetch
   try{ player.pause(); }catch{}
   if (ttsAbort) { try { ttsAbort.abort(); } catch {} ttsAbort = undefined; }
   if (ttsBlobURL) { URL.revokeObjectURL(ttsBlobURL); ttsBlobURL = ''; }
@@ -242,16 +285,16 @@ function stopTTSLocal(){
 
 async function stopTTS(){
   stopTTSLocal();
-  try { await fetch(`${API_BASE}/api/tts/stop`, { method:'POST' }); } catch {}
+  try { await fetch(`${ORIGIN}${API_PREFIX}/tts/stop`, { method:'POST' }); } catch {}
   toast('TTS stopped','warn');
 }
 
-// UI events
-startBtn.addEventListener('click', start);
-stopBtn.addEventListener('click', stop);
-speakBtn.addEventListener('click', speak);
-stopTTSBtn.addEventListener('click', stopTTS);
+// ====== UI events ======
+document.getElementById('start').addEventListener('click', start);
+document.getElementById('stop').addEventListener('click', stop);
+document.getElementById('speak').addEventListener('click', speak);
+document.getElementById('stopTTS').addEventListener('click', stopTTS);
 
-// When user clicks play on the audio and then starts speaking, we still hard-stop
-scope.addEventListener('click', ()=>{}); // keeps canvas active for resizing
+// keep canvas live for ResizeObserver
+scope.addEventListener('click', ()=>{});
 new ResizeObserver(()=>{}).observe(scope);
