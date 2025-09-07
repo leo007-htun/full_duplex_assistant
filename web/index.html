@@ -2,183 +2,90 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>OpenAI Voice Assistant</title>
+  <title>Voice Assistant</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/bundle.min.js"></script>
 </head>
-<body class="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 min-h-screen flex items-center justify-center">
-
-  <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-lg text-center">
-    <h1 class="text-2xl font-bold text-gray-800 mb-6">🎤 OpenAI Voice Assistant</h1>
-
-    <button id="startBtn" 
-      class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-full transition duration-200 shadow-md">
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen">
+  <div class="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-lg text-center">
+    <h1 class="text-2xl font-bold mb-4">🎙️ Browser Voice Assistant</h1>
+    <button id="startBtn" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg">
       Start Talking
     </button>
-
-    <div class="mt-6 text-left">
-      <h2 class="text-lg font-semibold text-gray-700">Transcript</h2>
-      <p id="transcript" class="p-3 bg-gray-100 rounded-lg min-h-[50px] text-gray-800"></p>
+    <div class="mt-6">
+      <h2 class="text-lg font-semibold">Transcript</h2>
+      <p id="transcript" class="bg-gray-700 p-3 rounded mt-2"></p>
     </div>
-
-    <div class="mt-6 text-left">
-      <h2 class="text-lg font-semibold text-gray-700">Assistant</h2>
-      <p id="response" class="p-3 bg-indigo-50 rounded-lg min-h-[50px] text-gray-900"></p>
+    <div class="mt-6">
+      <h2 class="text-lg font-semibold">Assistant Response</h2>
+      <p id="response" class="bg-gray-700 p-3 rounded mt-2"></p>
     </div>
   </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/bundle.min.js"></script>
-<script>
-let mediaRecorder;
-let audioChunks = [];
-let audioContext;
-let ttsAudio = null;
+  <script>
+    let mediaRecorder;
+    let audioChunks = [];
+    let currentAudio = null;
 
-// ⚠️ IMPORTANT: never expose your real API key in frontend code.
-// Replace with an ephemeral key provided by your backend.
-const OPENAI_API_KEY = "YOUR_API_KEY";
-
-const transcriptEl = document.getElementById("transcript");
-const responseEl = document.getElementById("response");
-const startBtn = document.getElementById("startBtn");
-
-// --------------------
-// VAD setup
-// --------------------
-async function setupVAD(stream) {
-  const vadInstance = await vad.MicVAD.new({
-    stream,
-    onSpeechStart: () => {
-      console.log("🎙️ User started talking, stopping TTS...");
-      stopTTS();
+    function stopTTS() {
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio = null;
+      }
     }
-  });
-  vadInstance.start();
-}
 
-// --------------------
-// Recording Control
-// --------------------
-async function startRecording() {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioContext = new AudioContext();
+    async function setupVAD(stream) {
+      const vadInstance = await window.vad.MicVAD.new({
+        stream,
+        onSpeechStart: () => {
+          console.log("🎙️ User speaking → stop TTS");
+          stopTTS();
+        }
+      });
+      vadInstance.start();
+    }
 
-  setupVAD(stream);
+    async function startRecording() {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setupVAD(stream);
 
-  mediaRecorder = new MediaRecorder(stream);
-  mediaRecorder.ondataavailable = e => {
-    audioChunks.push(e.data);
-  };
+      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      audioChunks = [];
 
-  mediaRecorder.onstop = async () => {
-    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-    audioChunks = [];
-    await sendToOpenAI(audioBlob);
-  };
+      mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
 
-  mediaRecorder.start();
-  console.log("🎙️ Recording started...");
-}
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(audioChunks, { type: "audio/webm" });
+        const formData = new FormData();
+        formData.append("file", blob, "input.webm");
 
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop();
-    console.log("🛑 Recording stopped.");
-  }
-}
+        const resp = await fetch("/api/transcribe", { method: "POST", body: formData });
+        const data = await resp.json();
+        document.getElementById("transcript").innerText = data.text;
 
-// --------------------
-// Send to OpenAI (STT + Chat + TTS)
-// --------------------
-async function sendToOpenAI(audioBlob) {
-  // ---- Speech-to-Text
-  const formData = new FormData();
-  formData.append("file", audioBlob, "speech.webm");
-  formData.append("model", "gpt-4o-transcribe");
+        const intentResp = await fetch("/api/determine_intent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: data.text })
+        });
+        const intentData = await intentResp.json();
+        document.getElementById("response").innerText = intentData.result;
 
-  const sttResp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: formData
-  });
+        const ttsResp = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: intentData.result })
+        });
+        const audioBlob = await ttsResp.blob();
+        currentAudio = new Audio(URL.createObjectURL(audioBlob));
+        currentAudio.play();
+      };
 
-  const sttData = await sttResp.json();
-  const userText = sttData.text;
-  transcriptEl.innerText = userText;
+      mediaRecorder.start();
+      setTimeout(() => mediaRecorder.stop(), 5000); // record 5s at a time
+    }
 
-  // ---- Chat Completion
-  const chatResp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: userText }]
-    })
-  });
-
-  const chatData = await chatResp.json();
-  const reply = chatData.choices[0].message.content;
-  responseEl.innerText = reply;
-
-  // ---- TTS
-  await playTTS(reply);
-}
-
-// --------------------
-// TTS
-// --------------------
-async function playTTS(text) {
-  stopTTS(); // cancel any ongoing playback
-
-  const ttsResp = await fetch("https://api.openai.com/v1/audio/speech", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini-tts",
-      voice: "alloy",
-      input: text
-    })
-  });
-
-  const arrayBuffer = await ttsResp.arrayBuffer();
-  const audioBlob = new Blob([arrayBuffer], { type: "audio/mp3" });
-  const audioUrl = URL.createObjectURL(audioBlob);
-  ttsAudio = new Audio(audioUrl);
-  ttsAudio.play();
-}
-
-function stopTTS() {
-  if (ttsAudio) {
-    ttsAudio.pause();
-    ttsAudio.src = "";
-    ttsAudio = null;
-    console.log("🔇 TTS stopped.");
-  }
-}
-
-// --------------------
-// Button Control
-// --------------------
-startBtn.addEventListener("click", () => {
-  if (!mediaRecorder || mediaRecorder.state === "inactive") {
-    startRecording();
-    startBtn.innerText = "Stop Talking";
-    startBtn.classList.remove("bg-indigo-600");
-    startBtn.classList.add("bg-red-600", "hover:bg-red-700");
-  } else {
-    stopRecording();
-    startBtn.innerText = "Start Talking";
-    startBtn.classList.remove("bg-red-600", "hover:bg-red-700");
-    startBtn.classList.add("bg-indigo-600");
-  }
-});
-</script>
+    document.getElementById("startBtn").addEventListener("click", startRecording);
+  </script>
 </body>
 </html>
