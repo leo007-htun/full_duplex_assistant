@@ -1,29 +1,84 @@
-assistant:
-  build:
-    context: ./src                # build context contains your /assistant code
-    dockerfile: ./assistant/utils/Dockerfile
-  image: full-duplex-assistant:latest
-  # WORKDIR is /app from your Dockerfile; PYTHONPATH=/app/src is already set there
-  env_file:
-    - ./src/assistant/.env        # must contain OPENAI_API_KEY=...
-  environment:
-    - ENABLE_VOICE=0
-    - ALLOWED_ORIGINS=https://com-cloud.cloud
-  expose:
-    - "8000"
-  healthcheck:
-    test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else sys.exit(1)\""]
-    interval: 10s
-    timeout: 5s
-    retries: 6
-    start_period: 20s
-  labels:
-    - "traefik.enable=true"
-    - "traefik.docker.network=full_duplex_web"
-    - "traefik.http.routers.assistant.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)"
-    - "traefik.http.routers.assistant.entrypoints=websecure"
-    - "traefik.http.routers.assistant.tls.certresolver=letsencrypt"
-    - "traefik.http.routers.assistant.priority=100"
-    - "traefik.http.services.assistant.loadbalancer.server.port=8000"
-  networks: [web]
-  restart: unless-stopped
+version: "3.9"
+
+services:
+  init_letsencrypt:
+    image: alpine:3.20
+    command: sh -c "mkdir -p /letsencrypt && touch /letsencrypt/acme.json && chmod 600 /letsencrypt/acme.json"
+    volumes:
+      - ./letsencrypt:/letsencrypt
+    restart: "no"
+
+  traefik:
+    image: traefik:v3.0
+    depends_on:
+      init_letsencrypt:
+        condition: service_completed_successfully
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=full_duplex_web
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --certificatesresolvers.letsencrypt.acme.email=${LE_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --log.level=DEBUG
+      - --accesslog=true
+      - --api.dashboard=true
+      - --api.insecure=true
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - ./letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [web]
+    restart: unless-stopped
+
+  web:
+    image: nginx:alpine
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=full_duplex_web"
+      - "traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && !PathPrefix(`/api`) && !PathPrefix(`/ws`)"
+      - "traefik.http.routers.web.entrypoints=websecure"
+      - "traefik.http.routers.web.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.web.priority=1"
+      - "traefik.http.services.web.loadbalancer.server.port=80"
+    networks: [web]
+    restart: unless-stopped
+
+  assistant:
+    # Use a string path for build (old compose requirement)
+    build: ./src
+    # dockerfile path is relative to the build context above
+    dockerfile: assistant/utils/Dockerfile
+    image: full-duplex-assistant:latest
+    working_dir: /app
+    env_file:
+      - ./src/assistant/.env   # must include OPENAI_API_KEY=...
+    environment:
+      - ENABLE_VOICE=0
+      - ALLOWED_ORIGINS=https://com-cloud.cloud
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=full_duplex_web"
+      - "traefik.http.routers.assistant.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.assistant.entrypoints=websecure"
+      - "traefik.http.routers.assistant.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.assistant.priority=100"
+      - "traefik.http.services.assistant.loadbalancer.server.port=8000"
+    networks: [web]
+    restart: unless-stopped
+
+networks:
+  web:
+    driver: bridge
+    name: full_duplex_web
