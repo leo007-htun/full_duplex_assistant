@@ -1,91 +1,55 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="utf-8" />
   <title>Voice Assistant</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/bundle.min.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+    button { padding: .6rem 1rem; margin-right: .5rem; }
+    .row { margin: 1rem 0; }
+    textarea { width: 100%; min-height: 80px; }
+    #log { white-space: pre-wrap; font-size: .9rem; color: #333; background: #f6f6f6; padding: .5rem; border-radius: 8px; }
+  </style>
 </head>
-<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen">
-  <div class="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-lg text-center">
-    <h1 class="text-2xl font-bold mb-4">🎙️ Browser Voice Assistant</h1>
-    <button id="startBtn" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg">
-      Start Talking
-    </button>
-    <div class="mt-6">
-      <h2 class="text-lg font-semibold">Transcript</h2>
-      <p id="transcript" class="bg-gray-700 p-3 rounded mt-2"></p>
-    </div>
-    <div class="mt-6">
-      <h2 class="text-lg font-semibold">Assistant Response</h2>
-      <p id="response" class="bg-gray-700 p-3 rounded mt-2"></p>
-    </div>
+<body>
+  <h1>Browser-First Voice Assistant</h1>
+
+  <div class="row">
+    <button id="record">🎙️ Start Recording</button>
+    <button id="stop" disabled>⏹️ Stop</button>
   </div>
 
-  <script>
-    let mediaRecorder;
-    let audioChunks = [];
-    let currentAudio = null;
+  <div class="row">
+    <strong>Transcription:</strong>
+    <div id="transcript"></div>
+  </div>
 
-    function stopTTS() {
-      if (currentAudio) {
-        currentAudio.pause();
-        currentAudio = null;
-      }
-    }
+  <hr/>
 
-    async function setupVAD(stream) {
-      const vadInstance = await window.vad.MicVAD.new({
-        stream,
-        onSpeechStart: () => {
-          console.log("🎙️ User speaking → stop TTS");
-          stopTTS();
-        }
-      });
-      vadInstance.start();
-    }
+  <div class="row">
+    <strong>Text to speak:</strong>
+    <textarea id="ttsText">Hello there! This is a test of the streaming TTS endpoint.</textarea>
+  </div>
+  <div class="row">
+    <label for="voice">Voice:</label>
+    <select id="voice">
+      <option value="alloy" selected>alloy</option>
+      <option value="verse">verse</option>
+      <option value="aria">aria</option>
+    </select>
+    <button id="speak">🔊 Speak</button>
+  </div>
 
-    async function startRecording() {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setupVAD(stream);
+  <div class="row">
+    <audio id="player" controls></audio>
+  </div>
 
-      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      audioChunks = [];
+  <div class="row">
+    <strong>Log</strong>
+    <div id="log"></div>
+  </div>
 
-      mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(audioChunks, { type: "audio/webm" });
-        const formData = new FormData();
-        formData.append("file", blob, "input.webm");
-
-        const resp = await fetch("/api/transcribe", { method: "POST", body: formData });
-        const data = await resp.json();
-        document.getElementById("transcript").innerText = data.text;
-
-        const intentResp = await fetch("/api/determine_intent", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: data.text })
-        });
-        const intentData = await intentResp.json();
-        document.getElementById("response").innerText = intentData.result;
-
-        const ttsResp = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: intentData.result })
-        });
-        const audioBlob = await ttsResp.blob();
-        currentAudio = new Audio(URL.createObjectURL(audioBlob));
-        currentAudio.play();
-      };
-
-      mediaRecorder.start();
-      setTimeout(() => mediaRecorder.stop(), 5000); // record 5s at a time
-    }
-
-    document.getElementById("startBtn").addEventListener("click", startRecording);
-  </script>
+  <script src="./app.js" type="module"></script>
 </body>
 </html>
