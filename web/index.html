@@ -26,9 +26,8 @@
     </div>
   </div>
 
-<script type="module">
-import { MicVAD } from "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/index.js";
-
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.11/dist/bundle.min.js"></script>
+<script>
 let mediaRecorder;
 let audioChunks = [];
 let audioContext;
@@ -46,14 +45,14 @@ const startBtn = document.getElementById("startBtn");
 // VAD setup
 // --------------------
 async function setupVAD(stream) {
-  const vad = await MicVAD.new({
+  const vadInstance = await vad.MicVAD.new({
     stream,
     onSpeechStart: () => {
       console.log("🎙️ User started talking, stopping TTS...");
       stopTTS();
     }
   });
-  vad.start();
+  vadInstance.start();
 }
 
 // --------------------
