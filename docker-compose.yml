@@ -57,38 +57,26 @@ services:
     image: python:3.11-slim
     working_dir: /app
     command: >
-      sh -lc "set -e
-      && apt-get update
-      && apt-get install -y --no-install-recommends
-         portaudio19-dev ffmpeg
-         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0
-         libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0
-         libpangocairo-1.0-0 libgtk-3-0
-      && rm -rf /var/lib/apt/lists/*
-      && pip install --no-cache-dir
-         fastapi
-         'uvicorn[standard]'
-         pydantic
-         jinja2
-         python-multipart
-         openai
-         websockets
-         python-dotenv
-         pyaudio
-         sounddevice
-         playwright
-      && python -m playwright install --with-deps
-      && python -m uvicorn assistant.app:app
-         --host 0.0.0.0
-         --port 8000
-         --proxy-headers
-         --forwarded-allow-ips=*"
+      sh -lc "set -e &&
+      apt-get update &&
+      apt-get install -y --no-install-recommends
+      ffmpeg libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0
+      libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libpangocairo-1.0-0 libgtk-3-0 &&
+      rm -rf /var/lib/apt/lists/* &&
+      pip install --no-cache-dir
+      fastapi 'uvicorn[standard]' pydantic jinja2 python-multipart openai websockets python-dotenv playwright &&
+      python -m playwright install --with-deps &&
+      python -m uvicorn assistant.app:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --forwarded-allow-ips=*"
     volumes:
       - ./src:/app
     env_file:
       - ./src/assistant/.env
     environment:
-      - ENABLE_VOICE=1
+      - ENABLE_VOICE=0
       - ALLOWED_ORIGINS=https://com-cloud.cloud
     expose:
       - "8000"
@@ -102,12 +90,6 @@ services:
       - "traefik.http.services.assistant.loadbalancer.server.port=8000"
     networks: [web]
     restart: unless-stopped
-    # If you truly need server-side microphone access inside the container,
-    # uncomment the following lines and ensure the host has /dev/snd available:
-    # devices:
-    #   - /dev/snd:/dev/snd
-    # group_add:
-    #   - "audio"
 
 networks:
   web:
