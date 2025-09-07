@@ -5,7 +5,7 @@ import json
 import os
 from typing import Dict, List, Optional, AsyncIterator
 
-import pyaudio
+#import pyaudio
 import websockets
 from fastapi import FastAPI, UploadFile, File, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -267,7 +267,8 @@ async def stop_tts():
 # =========================================================
 RATE = 16000
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
+#FORMAT = pyaudio.paInt16
+FORMAT = None
 CHANNELS = 1
 
 async def mic_stream_vad():
@@ -275,6 +276,9 @@ async def mic_stream_vad():
     Optional server-side VAD using OpenAI Realtime Transcription API.
     Runs only if ENABLE_VOICE=1. Interrupts server TTS on speech start.
     """
+    import pyaudio
+    global FORMAT
+    FORMAT = pyaudio.paInt16
     if not OPENAI_API_KEY:
         print("⚠️  OPENAI_API_KEY not set; skipping server VAD loop.")
         return
