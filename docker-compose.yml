@@ -56,7 +56,7 @@ services:
   assistant:
     build:
       context: .
-      dockerfile: src/assistant/utils.Dockerfile
+      dockerfile: src/assistant/utils/Dockerfile
     container_name: full_duplex_assistant_1
     volumes:
       - ./src:/app
