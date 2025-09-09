@@ -118,46 +118,75 @@ async def get_weather():
 # Intent → route → (optionally speak on server) → return text
 # =========================================================
 @api.post("/determine_intent")
-async def determine_intent(msg: ChatMessage):
+async def determine_intent(msg: ChatMessage, request: Request):  # Add request parameter
     global conversation_history
     user_text = msg.message
 
-    # 1) classify
-    intent_data = await determine_intent_gpt(user_text)
-    intent = intent_data.get("intent", "unknown")
-    reason = intent_data.get("reason", "")
+    try:
+        # Check if the client disconnected before we start processing
+        if await request.is_disconnected():
+            return JSONResponse({"error": "Request aborted"}, status_code=499)
+            
+        # 1) classify intent
+        intent_data = await determine_intent_gpt(user_text)
+        intent = intent_data.get("intent", "unknown")
+        reason = intent_data.get("reason", "")
+        
+        # Check again if client disconnected after intent classification
+        if await request.is_disconnected():
+            return JSONResponse({"error": "Request aborted"}, status_code=499)
 
-    # 2) route
-    if intent == "weather":
-        data = await get_weather()
-        result = f"The forecast is {data['forecast']}."
-    elif intent == "smalltalk":
-        sys_prompt = render_system_prompt("SESSION-001")
-        convo = [{"role": "system", "content": sys_prompt}] + conversation_history
-        convo.append({"role": "user", "content": user_text})
-        chat = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=convo,
-            temperature=0.7,
-        )
-        result = (chat.choices[0].message.content or "").strip()
-        conversation_history += [
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": result},
-        ]
-        if len(conversation_history) > 40:
-            conversation_history = conversation_history[-40:]
-    elif intent == "web_search":
-        # stub; you can call your scraper + summarizer here
-        result = "Here’s what I found on the web (stub)."
-    else:
-        result = "Hmm, I’m not sure what you mean."
-
-    # 3) optionally speak on the server device (if you run on a desktop)
-    await speak_tts_locally(result)
-
-    # 4) return text for the browser to TTS
-    return {"intent": intent, "reason": reason, "result": result}
+        # 2) route based on intent
+        if intent == "weather":
+            data = await get_weather()
+            result = f"The forecast is {data['forecast']}."
+        elif intent == "smalltalk":
+            sys_prompt = render_system_prompt("SESSION-001")
+            convo = [{"role": "system", "content": sys_prompt}] + conversation_history
+            convo.append({"role": "user", "content": user_text})
+            
+            # Check if client disconnected before LLM call
+            if await request.is_disconnected():
+                return JSONResponse({"error": "Request aborted"}, status_code=499)
+                
+            chat = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=convo,
+                temperature=0.7,
+            )
+            
+            # Check if client disconnected after LLM call
+            if await request.is_disconnected():
+                return JSONResponse({"error": "Request aborted"}, status_code=499)
+                
+            result = (chat.choices[0].message.content or "").strip()
+            conversation_history += [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": result},
+            ]
+            if len(conversation_history) > 40:
+                conversation_history = conversation_history[-40:]
+        elif intent == "web_search":
+            # stub; you can call your scraper + summarizer here
+            result = "Here's what I found on the web (stub)."
+        else:
+            result = "Hmm, I'm not sure what you mean."
+    
+        # 3) optionally speak on the server device (if you run on a desktop)
+        # This is non-blocking and won't affect the HTTP response
+        asyncio.create_task(speak_tts_locally(result))
+    
+        # 4) return text for the browser to TTS
+        return {"intent": intent, "reason": reason, "result": result}
+        
+    except asyncio.CancelledError:
+        # Request was cancelled/aborted
+        return JSONResponse({"error": "Request cancelled"}, status_code=499)
+        
+    except Exception as e:
+        # Handle other exceptions
+        print(f"Error in determine_intent: {e}")
+        return JSONResponse({"error": f"Internal server error: {str(e)}"}, status_code=500)
 
 # =========================================================
 # STT for browser uploads (handles codecs=…)
