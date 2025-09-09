@@ -216,49 +216,76 @@ async function uploadChunk(mimeType){
     fd.append('file', blob, `input.${ext}`);
 
     // --- STT ---
-    const sttResp = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
-    console.log('STT Response:', sttResp.status); 
-    const sttTextBody = await sttResp.text();
+    console.log('Sending STT request...');
+    const sttResp = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { 
+      method: 'POST', 
+      body: fd,
+      signal: intentAbort?.signal // Attach abort signal here too
+    });
+    
+    console.log('STT Response status:', sttResp.status);
+    
     if (!sttResp.ok) {
-      console.error('[STT http error]', sttResp.status, sttResp.statusText, sttTextBody);
-      throw new Error(`${sttResp.status} ${sttResp.statusText} ${sttTextBody}`);
+      const errorText = await sttResp.text();
+      console.error('[STT HTTP Error]', sttResp.status, errorText);
+      throw new Error(`STT failed: ${sttResp.status} ${errorText}`);
     }
-    const sttData = JSON.parse(sttTextBody);
-    console.log('STT Data:', sttData);
+    
+    const sttData = await sttResp.json();
+    console.log('STT Data received:', sttData);
+    
     const text = (sttData.text || '').trim();
     transcriptEl.textContent = text;
-    if (!text) return;
+    console.log('Transcribed text:', text);
+    
+    if (!text) {
+      console.log('No text transcribed, skipping LLM call');
+      return;
+    }
 
     // --- INTENT / LLM ---
+    console.log('Sending to LLM...');
     intentAbort = new AbortController();
+    
     const ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text }),
       signal: intentAbort.signal
     });
-    const iText = await ir.text();
+    
+    console.log('LLM Response status:', ir.status);
+    
     if (!ir.ok) {
-      console.error('[INTENT http error]', ir.status, ir.statusText, iText);
-      throw new Error(`${ir.status} ${ir.statusText} ${iText}`);
+      const errorText = await ir.text();
+      console.error('[LLM HTTP Error]', ir.status, errorText);
+      throw new Error(`LLM failed: ${ir.status} ${errorText}`);
     }
-    const intent = JSON.parse(iText);
+    
+    const intent = await ir.json();
+    console.log('LLM Response:', intent);
+    
     const reply = (intent.result || '').trim();
-    if (!reply) return;
+    if (!reply) {
+      console.log('No reply from LLM');
+      return;
+    }
 
-    lastLLMReply = reply; // save for manual replay if wanted
+    lastLLMReply = reply;
+    console.log('LLM Reply:', reply);
 
-    // --- TTS (interruptible) ---
+    // --- TTS ---
     await speak(reply, voiceEl.value || 'alloy');
 
-  }catch(e){
-    if (e.name === 'AbortError') return; // user barged in — expected
+  } catch(e) {
+    if (e.name === 'AbortError') {
+      console.log('Pipeline aborted (user spoke again)');
+      return;
+    }
     console.error('Transcribe/LLM pipeline failed:', e);
     toast('Speech pipeline failed','bad');
   }
 }
-
-
 
 // ===== Mic start/stop =====
 async function start(){
