@@ -9,6 +9,7 @@
     :root{
       --bg:#0b0f14; --panel:#0f1520; --panel-2:#0c1118; --text:#e8f0ff; --muted:#9fb0c6;
       --brand:#4cc9f0; --accent:#22d3ee; --border:rgba(255,255,255,.08); --radius:16px;
+      --shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
       --ok:#10b981; --warn:#f59e0b; --bad:#ef4444;
     }
     *{box-sizing:border-box} html,body{height:100%}
@@ -23,28 +24,30 @@
     .wrap{max-width:1100px; margin:0 auto; padding:40px 20px 80px}
     .header{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:24px}
     .logo{display:flex; gap:10px; align-items:center; font-weight:700}
-    .dot{width:10px; height:10px; border-radius:50%; background:conic-gradient(from 0deg, var(--brand), var(--accent))}
+    .dot{width:10px; height:10px; border-radius:50%; background:conic-gradient(from 0deg, var(--brand), var(--accent)); box-shadow:0 0 18px var(--brand)}
     .badge{font-size:12px; padding:6px 10px; border:1px solid var(--border); color:var(--muted);
       background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border-radius:999px}
     .grid{display:grid; grid-template-columns:1.1fr .9fr; gap:20px}
-    .panel{background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border:1px solid var(--border); border-radius:16px}
+    .panel{background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden}
     .panel .hd{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border)}
     .panel .bd{padding:14px}
     .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
-    .btn{border:1px solid var(--border); color:var(--text); background:#0c1118; padding:10px 12px; border-radius:12px; cursor:pointer}
+    .btn{border:1px solid var(--border); color:var(--text); background:var(--panel-2); padding:10px 12px; border-radius:12px; cursor:pointer; transition:.15s transform,.2s border-color}
+    .btn:hover{transform:translateY(-1px); border-color:#2a3342}
+    .btn:disabled{opacity:.6; cursor:not-allowed}
     .btn.primary{background:linear-gradient(180deg, rgba(76,201,240,.18), rgba(67,97,238,.14)); border-color:rgba(76,201,240,.35)}
     .btn.warn{border-color:rgba(245,158,11,.4); background:linear-gradient(180deg, rgba(245,158,11,.12), rgba(245,158,11,.06))}
-    textarea, select{background:#0c1118; color:var(--text); border:1px solid var(--border); border-radius:12px; outline:none}
+    textarea, select{background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:12px; outline:none}
     textarea{width:100%; min-height:120px; padding:12px}
     select{padding:10px 12px}
-    .canvas{width:100%; height:72px; border:1px solid var(--border); border-radius:10px}
+    .canvas{width:100%; height:72px; border:1px solid var(--border); border-radius:10px; background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01))}
     .bar{height:8px; border-radius:8px; background:linear-gradient(90deg, #1f2a3a, #17202c); overflow:hidden; border:1px solid var(--border)}
     .fill{height:100%; width:0%; background:linear-gradient(90deg, var(--brand), var(--accent)); transition:width .06s linear}
-    .log{height:140px; overflow:auto; white-space:pre-wrap; padding:10px; border-radius:10px; border:1px solid var(--border); background:#0c1118; font-size:12px; color:#cfe4ff}
-    .muted{color:#9fb0c6}
-    .chip{display:inline-flex; gap:6px; align-items:center; padding:6px 10px; border-radius:999px; border:1px dashed var(--border); color:#9fb0c6; font-size:12px}
-    .ok{color:#10b981} .warn{color:#f59e0b} .bad{color:#ef4444}
-    .toast{position:fixed; right:20px; bottom:20px; background:#0f1520; border:1px solid var(--border); border-radius:12px; padding:10px 12px; display:none; min-width:240px}
+    .log{height:140px; overflow:auto; white-space:pre-wrap; padding:10px; border-radius:10px; border:1px solid var(--border); background:var(--panel-2); font-size:12px; color:#cfe4ff}
+    .muted{color:var(--muted)}
+    .chip{display:inline-flex; gap:6px; align-items:center; padding:6px 10px; border-radius:999px; border:1px dashed var(--border); color:var(--muted); font-size:12px}
+    .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+    .toast{position:fixed; right:20px; bottom:20px; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px; display:none; min-width:240px; box-shadow:var(--shadow)}
     .toast.show{display:block; animation:in .25s ease}
     @keyframes in{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:translateY(0)}}
   </style>
@@ -60,6 +63,7 @@
     </div>
 
     <div class="grid">
+      <!-- Left: Realtime Mic + VAD -->
       <div class="panel">
         <div class="hd">
           <div>Realtime Mic + VAD</div>
@@ -71,29 +75,33 @@
         <div class="bd">
           <div class="row" style="margin-bottom:10px">
             <button id="start" class="btn primary">🎙 Start</button>
-            <button id="stop" class="btn warn" disabled>⏹ Stop</button>
+            <button id="stop"  class="btn warn" disabled>⏹ Stop</button>
             <div class="bar" style="flex:1"><div id="level" class="fill"></div></div>
             <select id="mime">
               <option value="audio/webm" selected>audio/webm</option>
-              <option value="audio/wav">audio/wav</option>
+              <option value="audio/ogg">audio/ogg</option>
               <option value="audio/mp4">audio/mp4</option>
+              <option value="audio/mpeg">audio/mpeg</option>
             </select>
           </div>
+
           <canvas id="scope" class="canvas"></canvas>
+
           <div style="margin-top:12px"><strong>Transcript</strong>
             <div id="transcript" class="log"></div>
           </div>
         </div>
       </div>
 
+      <!-- Right: TTS -->
       <div class="panel">
         <div class="hd">
           <div>Speech Synthesis</div>
           <div class="row"><span class="chip">Codec mp3</span></div>
         </div>
         <div class="bd">
-          <label class="muted">Text</label>
-          <textarea id="ttsText">Hi! Start talking anytime — TTS will cut off instantly. 🔇➡️🎙</textarea>
+          <label class="muted">Manual text (optional)</label>
+          <textarea id="ttsText">Hi! Start talking — I’ll answer by voice, and I’ll cut off instantly if you speak.</textarea>
           <div class="row" style="margin-top:10px">
             <select id="voice">
               <option value="alloy" selected>alloy</option>
@@ -101,7 +109,7 @@
               <option value="verse">verse</option>
               <option value="nova">nova</option>
             </select>
-            <button id="speak" class="btn primary">🔊 Speak</button>
+            <button id="speak"   class="btn primary">🔊 Speak</button>
             <button id="stopTTS" class="btn">🛑 Stop TTS</button>
           </div>
           <audio id="player" controls style="width:100%; margin-top:10px"></audio>
@@ -112,6 +120,7 @@
   </div>
 
   <div id="toast" class="toast"></div>
+
   <script type="module" src="./app.js"></script>
 </body>
 </html>
