@@ -207,6 +207,7 @@ function chooseMime() {
 async function uploadChunk(mimeType){
   try{
     const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+    console.log('Uploading blob:', blob.size, 'bytes, type:', mimeType); 
     chunks = [];
     if (!blob.size) return;
 
@@ -216,12 +217,14 @@ async function uploadChunk(mimeType){
 
     // --- STT ---
     const sttResp = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
+    console.log('STT Response:', sttResp.status); 
     const sttTextBody = await sttResp.text();
     if (!sttResp.ok) {
       console.error('[STT http error]', sttResp.status, sttResp.statusText, sttTextBody);
       throw new Error(`${sttResp.status} ${sttResp.statusText} ${sttTextBody}`);
     }
     const sttData = JSON.parse(sttTextBody);
+    console.log('STT Data:', sttData);
     const text = (sttData.text || '').trim();
     transcriptEl.textContent = text;
     if (!text) return;
