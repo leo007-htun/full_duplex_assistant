@@ -175,4 +175,6 @@ async def tts_stop():
 
 # Wire router + health mirror
 app.include_router(api)
-@app.get("/healthz") async def healthz_root(): return await healthz()
+@app.get("/healthz") 
+async def healthz_root(): 
+    return await healthz()
