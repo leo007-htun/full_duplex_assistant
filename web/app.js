@@ -67,11 +67,17 @@ let ctx, analyser, source, rafId;
 let stream, recorder, chunks = [], recording = false;
 
 // ===== TTS control (hard barge-in) =====
-let ttsAbort;        // AbortController for in-flight fetch
-let ttsBlobURL = ''; // active ObjectURL
+let ttsAbort;
+let ttsBlobURL = '';
+let ttsPlaying = false; // track playback to avoid self-barge-in
+
+player.addEventListener('playing', () => { ttsPlaying = true; });
+player.addEventListener('pause',   () => { ttsPlaying = false; });
+player.addEventListener('ended',   () => { ttsPlaying = false; });
 
 function stopTTSLocal(){
   try{ player.pause(); }catch{}
+  ttsPlaying = false;
   if (ttsAbort && !ttsAbort.signal.aborted) try { ttsAbort.abort(); } catch {}
   ttsAbort = undefined;
   if (ttsBlobURL) { URL.revokeObjectURL(ttsBlobURL); ttsBlobURL=''; }
@@ -99,7 +105,7 @@ function drawScope() {
   const energy = Math.sqrt(sum/data.length);
   level.style.width = Math.min(100, Math.round(energy*100)) + '%';
 
-  // simple scope
+  // scope
   c.clearRect(0,0,w,h);
   c.lineWidth=2; c.strokeStyle='rgba(76,201,240,.9)'; c.beginPath();
   const slice = w / data.length;
@@ -109,12 +115,15 @@ function drawScope() {
   }
   c.stroke();
 
-  // adaptive floor
+  // adaptive floor + VAD decision
   noiseFloor = 0.98*noiseFloor + 0.02*energy;
   const dynThresh = Math.max(VAD_THRESHOLD, noiseFloor*2.25);
 
+  // Stronger barge-in rule while TTS plays to reduce echo triggers
+  const requireFactor = ttsPlaying ? 2.4 : 1.0;
   const now = performance.now();
-  if (energy >= dynThresh) {
+
+  if (energy >= dynThresh * requireFactor) {
     if (!vadSpeaking) onSpeechStart();
     vadSpeaking = true;
     vadSilenceSince = 0;
@@ -141,7 +150,7 @@ async function onSpeechStart(){
     catch { recorder = new MediaRecorder(stream); }
     recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
     recorder.onstop = () => { if (chunks.length) uploadChunk(recorder.mimeType || mimeType); };
-    recorder.start(150); // ~150ms chunks for snappier uploads
+    recorder.start(150); // ~150ms chunks
     recording = true;
     micState.textContent = 'recording';
   }
@@ -181,16 +190,16 @@ async function uploadChunk(mimeType){
     const fd = new FormData();
     fd.append('file', blob, `input.${ext}`);
 
+    // 1) STT
     const r = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
     const textBody = await r.text();
     if (!r.ok) throw new Error(`${r.status} ${r.statusText} ${textBody}`);
     const data = JSON.parse(textBody);
     const text = (data.text || '').trim();
     transcriptEl.textContent = text;
-
     if (!text) return;
 
-    // Route to LLM
+    // 2) LLM (intent router)
     const ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ message: text })
@@ -201,7 +210,7 @@ async function uploadChunk(mimeType){
     const reply = (intent.result || '').trim();
     if (!reply) return;
 
-    // Speak reply (aborting if user talks again)
+    // 3) Speak reply (abortable)
     await speak(reply, voiceEl.value || 'alloy');
   }catch(e){
     log('Transcribe/LLM failed:', e?.message || e);
@@ -242,6 +251,9 @@ async function speak(text, voice='alloy'){
   stopTTSLocal();
   ttsAbort = new AbortController();
   try{
+    // Make sure AudioContext is active (prevents silent play issues)
+    try { if (ctx && ctx.state === 'suspended') await ctx.resume(); } catch {}
+
     const resp = await fetch(`${ORIGIN}${API_PREFIX}/tts`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ text, voice }),
@@ -263,10 +275,10 @@ async function speak(text, voice='alloy'){
 }
 
 // ===== UI wiring =====
-document.getElementById('start').addEventListener('click', start);
-document.getElementById('stop').addEventListener('click', stop);
-document.getElementById('speak').addEventListener('click', ()=>speak(ttsTextEl.value.trim(), voiceEl.value||'alloy'));
-document.getElementById('stopTTS').addEventListener('click', stopTTS);
+startBtn.addEventListener('click', start);
+stopBtn .addEventListener('click', stop);
+speakBtn.addEventListener('click', ()=>speak(ttsTextEl.value.trim(), voiceEl.value||'alloy'));
+stopTTSBtn.addEventListener('click', stopTTS);
 
 // keep canvas live for ResizeObserver
 scope.addEventListener('click', ()=>{});
