@@ -1,162 +1,273 @@
-import asyncio, io, json, os, base64
-from typing import Dict, List, Optional
-import websockets
-from fastapi import FastAPI, UploadFile, File, APIRouter
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
-from jinja2 import Environment, FileSystemLoader
+// ===== API origin & prefix detection =====
+const ORIGIN = location.origin;
+let API_PREFIX = '/api';
+const statusEl = document.getElementById('status');
+const apiEl    = document.getElementById('api');
 
-# your OpenAI client wrapper
-from .services.openai_client import client
-from .voice.tts_player import StreamingTTSPlayer
+async function fetchJSON(url, opts = {}, timeoutMs = 5000) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    let body;
+    try { body = await r.clone().json(); } catch { body = await r.text(); }
+    return { ok: r.ok, status: r.status, body };
+  } finally { clearTimeout(to); }
+}
+async function detectApiPrefix() {
+  for (const prefix of ['/api', '']) {
+    try {
+      const { ok, body } = await fetchJSON(`${ORIGIN}${prefix}/healthz`, {}, 2500);
+      if (ok && (body?.ok === true || (typeof body === 'string' && body.includes('"ok"')))) return prefix;
+    } catch {}
+  }
+  return '/api';
+}
+(async () => {
+  API_PREFIX = await detectApiPrefix();
+  apiEl.textContent = API_PREFIX || '/';
+  try {
+    const { ok } = await fetchJSON(`${ORIGIN}${API_PREFIX}/healthz`, {}, 2500);
+    statusEl.textContent = ok ? 'Online' : 'Degraded';
+    statusEl.className = ok ? 'ok' : 'warn';
+  } catch { statusEl.textContent = 'Offline'; statusEl.className = 'bad'; }
+})();
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
-ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
+// ===== UI refs =====
+const micState = document.getElementById('micState');
+const vadState = document.getElementById('vadState');
+const startBtn = document.getElementById('start');
+const stopBtn  = document.getElementById('stop');
+const transcriptEl = document.getElementById('transcript');
+const ttsTextEl = document.getElementById('ttsText');
+const voiceEl   = document.getElementById('voice');
+const speakBtn  = document.getElementById('speak');
+const stopTTSBtn= document.getElementById('stopTTS');
+const player    = document.getElementById('player');
+const logEl     = document.getElementById('log');
+const scope     = document.getElementById('scope');
+const level     = document.getElementById('level');
+const mimeSel   = document.getElementById('mime');
+const toastEl   = document.getElementById('toast');
 
-app = FastAPI(title="COM Cloud • Full-Duplex Assistant")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
-)
-api = APIRouter(prefix="/api")
+// ===== Toast / Log =====
+let toastTimer;
+function toast(msg, cls=''){ clearTimeout(toastTimer); toastEl.textContent=msg; toastEl.className=`toast show ${cls}`; toastTimer=setTimeout(()=>toastEl.className='toast',2400); }
+function log(...a){ console.log(...a); logEl.textContent += a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')+'\n'; logEl.scrollTop=logEl.scrollHeight; }
 
-# prompts
-PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
-_env = Environment(loader=FileSystemLoader(PROMPT_DIR))
-def intent_prompt(): return _env.get_template("intent_prompt.j2").render()
-def system_prompt(session_id="S-1"): return _env.get_template("system_prompt.j2").render(session_id=session_id)
+// ===== VAD params =====
+let VAD_THRESHOLD = 0.02;
+const VAD_HANGOVER_MS = 350;
+let vadSpeaking = false;
+let vadSilenceSince = 0;
+let noiseFloor = 0.01;
 
-# memory
-chat_history: List[Dict[str,str]] = []
-tts_player = StreamingTTSPlayer()
+// ===== Audio state =====
+let ctx, analyser, source, rafId;
+let stream, recorder, chunks = [], recording = false;
 
-# ===== Models =====
-class ChatIn(BaseModel): message: str
-class TTSIn(BaseModel):
-    text: str
-    voice: str = "alloy"
+// ===== TTS control (hard barge-in) =====
+let ttsAbort;        // AbortController for in-flight fetch
+let ttsBlobURL = ''; // active ObjectURL
 
-# ===== Health =====
-@api.get("/healthz")
-async def healthz(): return {"ok": True}
+function stopTTSLocal(){
+  try{ player.pause(); }catch{}
+  if (ttsAbort && !ttsAbort.signal.aborted) try { ttsAbort.abort(); } catch {}
+  ttsAbort = undefined;
+  if (ttsBlobURL) { URL.revokeObjectURL(ttsBlobURL); ttsBlobURL=''; }
+}
+async function stopTTS(){
+  stopTTSLocal();
+  try { await fetch(`${ORIGIN}${API_PREFIX}/tts/stop`, { method:'POST' }); } catch {}
+  toast('TTS stopped','warn');
+}
 
-# ===== Domain endpoints (examples to route to) =====
-@api.get("/weather")
-async def weather():
-    # replace with real weather integration
-    return {"type": "weather", "text": "Today looks sunny, about 25°C."}
+// ===== Draw + VAD =====
+function drawScope() {
+  const c = scope.getContext('2d');
+  const w = scope.width = scope.clientWidth;
+  const h = scope.height = scope.clientHeight;
 
-@api.post("/talk")
-async def talk(msg: ChatIn):
-    global chat_history
-    convo = [{"role": "system", "content": system_prompt()}] + chat_history
-    convo.append({"role":"user","content": msg.message})
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini", messages=convo, temperature=0.7
-    )
-    text = resp.choices[0].message.content.strip()
-    chat_history += [{"role":"user","content":msg.message},{"role":"assistant","content":text}]
-    chat_history[:] = chat_history[-40:]
-    return {"type":"talk","text": text}
+  const data = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(data);
 
-# ===== Intent router =====
-@api.post("/determine_intent")
-async def determine_intent(inp: ChatIn):
-    # classify
-    intent_resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role":"system","content": intent_prompt()},
-            {"role":"user","content": inp.message}
-        ],
-        temperature=0.2, response_format={"type":"json_object"}
-    )
-    try:
-        intent_obj = json.loads(intent_resp.choices[0].message.content)
-    except Exception:
-        intent_obj = {"intent":"unknown","reason":"parse-failed"}
+  // energy estimate
+  let sum=0, peak=0;
+  for (let i=0;i<data.length;i++){
+    const v=(data[i]-128)/128; sum+=v*v; if (Math.abs(v)>peak) peak=Math.abs(v);
+  }
+  const energy = Math.sqrt(sum/data.length);
+  level.style.width = Math.min(100, Math.round(energy*100)) + '%';
 
-    intent = intent_obj.get("intent","unknown")
+  // simple scope
+  c.clearRect(0,0,w,h);
+  c.lineWidth=2; c.strokeStyle='rgba(76,201,240,.9)'; c.beginPath();
+  const slice = w / data.length;
+  for (let i=0;i<data.length;i++){
+    const x=i*slice, y=(data[i]/255)*h;
+    if (i===0) c.moveTo(x,y); else c.lineTo(x,y);
+  }
+  c.stroke();
 
-    # route
-    if intent == "weather":
-        w = await weather()
-        return {"intent": intent, "result": w["text"]}
-    elif intent in ("smalltalk","talk","chat"):
-        t = await talk(ChatIn(message=inp.message))
-        return {"intent": "talk", "result": t["text"]}
-    else:
-        return {"intent": "unknown", "result": "Sorry, I didn't get that."}
+  // adaptive floor
+  noiseFloor = 0.98*noiseFloor + 0.02*energy;
+  const dynThresh = Math.max(VAD_THRESHOLD, noiseFloor*2.25);
 
-# ===== STT upload (accepts codecs params) =====
-@api.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
-    raw_ct = (file.content_type or "application/octet-stream").lower()
-    base_ct = raw_ct.split(";")[0].strip()
-    allowed = {"audio/webm","audio/ogg","audio/mpeg","audio/wav","audio/mp4","audio/x-m4a","application/octet-stream"}
-    if base_ct not in allowed:
-        return JSONResponse({"error": f"Unsupported content type: {raw_ct}"}, status_code=415)
+  const now = performance.now();
+  if (energy >= dynThresh) {
+    if (!vadSpeaking) onSpeechStart();
+    vadSpeaking = true;
+    vadSilenceSince = 0;
+  } else if (vadSpeaking) {
+    if (!vadSilenceSince) vadSilenceSince = now;
+    if (now - vadSilenceSince > VAD_HANGOVER_MS) {
+      onSpeechEnd();
+      vadSpeaking = false; vadSilenceSince = 0;
+    }
+  }
+  rafId = requestAnimationFrame(drawScope);
+}
 
-    data = await file.read()
-    if not data: return JSONResponse({"error":"Empty file"}, status_code=400)
-    if len(data) > 25*1024*1024: return JSONResponse({"error":"Too large"}, status_code=413)
+async function onSpeechStart(){
+  vadState.textContent = 'speaking'; vadState.className='ok';
+  // HARD barge-in: stop local/server TTS immediately
+  stopTTSLocal();
+  try { await fetch(`${ORIGIN}${API_PREFIX}/tts/stop`, { method:'POST' }); } catch {}
 
-    name = file.filename or "input"
-    if "." not in name:
-        name += { "audio/webm":".webm","audio/ogg":".ogg","audio/mpeg":".mp3","audio/wav":".wav",
-                  "audio/mp4":".m4a","audio/x-m4a":".m4a" }.get(base_ct,"")
-    try:
-        tr = await client.audio.transcriptions.create(
-            file=(name, io.BytesIO(data), base_ct),
-            model="gpt-4o-transcribe",
-        )
-        return {"text": tr.text}
-    except Exception as e:
-        return JSONResponse({"error": f"Transcription failed: {e}"}, status_code=500)
+  if (!recording) {
+    chunks = [];
+    const mimeType = chooseMime();
+    try { recorder = new MediaRecorder(stream, { mimeType }); }
+    catch { recorder = new MediaRecorder(stream); }
+    recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => { if (chunks.length) uploadChunk(recorder.mimeType || mimeType); };
+    recorder.start(150); // ~150ms chunks for snappier uploads
+    recording = true;
+    micState.textContent = 'recording';
+  }
+}
 
-# ===== TTS (MP3) — adaptive across SDK versions =====
-@api.post("/tts")
-async def tts(req: TTSIn):
-    text = (req.text or "").strip()
-    voice = (req.voice or "alloy").strip() or "alloy"
-    if not text: return JSONResponse({"error":"Empty text"}, status_code=400)
+function onSpeechEnd(){
+  vadState.textContent = 'silence'; vadState.className='muted';
+  if (recording && recorder && recorder.state !== 'inactive') {
+    recorder.stop();
+    recording = false;
+    micState.textContent = 'armed';
+  }
+}
 
-    variants = (
-        {"format":"mp3"}, {"response_format":"mp3"}, {"audio_format":"mp3"}, {}
-    )
-    last = None
-    for extra in variants:
-        try:
-            res = await client.audio.speech.create(
-                model="gpt-4o-mini-tts", voice=voice, input=text, **extra
-            )
-            buf = None
-            if hasattr(res,"content") and isinstance(res.content,(bytes,bytearray)):
-                buf = bytes(res.content)
-            elif hasattr(res,"read"): buf = await res.read()
-            elif isinstance(res,(bytes,bytearray)): buf = bytes(res)
-            if buf:
-                return Response(
-                    content=buf, media_type="audio/mpeg",
-                    headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"}
-                )
-        except TypeError as e:
-            last = e; continue
-        except Exception as e:
-            last = e; break
-    return JSONResponse({"error": f"TTS failed: {last}"}, status_code=500)
+function chooseMime() {
+  const prefs = [
+    mimeSel?.value,
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+    'audio/mp4',
+    'audio/mpeg'
+  ].filter(Boolean);
+  for (const m of prefs) { if (MediaRecorder.isTypeSupported?.(m)) return m; }
+  return ''; // let browser decide
+}
 
-# ===== Stop server-side PCM (if you use it) =====
-@api.post("/tts/stop")
-async def tts_stop():
-    try:
-        tts_player.stop()
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"error": f"stop failed: {e}"}, status_code=500)
+// ===== Upload, then LLM, then TTS back =====
+async function uploadChunk(mimeType){
+  try{
+    const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+    chunks = [];
+    if (!blob.size) return;
 
-# ===== Wire up router and health mirror =====
-app.include_router(api)
-@app.get("/healthz") async def healthz_root(): return await healthz()
+    const ext = (mimeType?.split?.('/')[1] || 'webm').split(';')[0] || 'webm';
+    const fd = new FormData();
+    fd.append('file', blob, `input.${ext}`);
+
+    const r = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
+    const textBody = await r.text();
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText} ${textBody}`);
+    const data = JSON.parse(textBody);
+    const text = (data.text || '').trim();
+    transcriptEl.textContent = text;
+
+    if (!text) return;
+
+    // Route to LLM
+    const ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ message: text })
+    });
+    const iText = await ir.text();
+    if (!ir.ok) throw new Error(`${ir.status} ${ir.statusText} ${iText}`);
+    const intent = JSON.parse(iText);
+    const reply = (intent.result || '').trim();
+    if (!reply) return;
+
+    // Speak reply (aborting if user talks again)
+    await speak(reply, voiceEl.value || 'alloy');
+  }catch(e){
+    log('Transcribe/LLM failed:', e?.message || e);
+    toast('Speech failed','bad');
+  }
+}
+
+// ===== Mic start/stop =====
+async function start(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ noiseSuppression:true, echoCancellation:true } });
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    source = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser(); analyser.fftSize = 2048; source.connect(analyser);
+    drawScope();
+    startBtn.disabled = true; stopBtn.disabled = false;
+    micState.textContent = 'armed';
+    vadState.textContent = 'ready'; vadState.className='muted';
+    toast('Mic ready. Start speaking…','ok');
+  }catch(e){
+    toast('Microphone blocked', 'bad'); log('getUserMedia error:', e?.message || e);
+  }
+}
+function stop(){
+  try{
+    cancelAnimationFrame(rafId);
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    if (stream) stream.getTracks().forEach(t=>t.stop());
+    if (ctx && ctx.state !== 'closed') ctx.close();
+  }catch{}
+  startBtn.disabled=false; stopBtn.disabled=true;
+  micState.textContent='idle'; vadState.textContent='ready'; vadState.className='muted';
+}
+
+// ===== TTS fetch/play (abortable) =====
+async function speak(text, voice='alloy'){
+  if (!text) return;
+  stopTTSLocal();
+  ttsAbort = new AbortController();
+  try{
+    const resp = await fetch(`${ORIGIN}${API_PREFIX}/tts`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ text, voice }),
+      signal: ttsAbort.signal
+    });
+    const body = await resp.arrayBuffer().catch(async () => {
+      const t = await resp.text(); throw new Error(`Bad TTS: ${resp.status} ${t}`);
+    });
+    if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
+    if (!body.byteLength) throw new Error('Empty audio');
+
+    const blob = new Blob([body], { type:'audio/mpeg' });
+    ttsBlobURL = URL.createObjectURL(blob);
+    player.pause(); player.src = ttsBlobURL; player.load();
+    try { await player.play(); } catch {}
+  }catch(e){
+    if (e.name !== 'AbortError') { log('TTS error:', e?.message || e); toast('TTS failed','bad'); }
+  }
+}
+
+// ===== UI wiring =====
+document.getElementById('start').addEventListener('click', start);
+document.getElementById('stop').addEventListener('click', stop);
+document.getElementById('speak').addEventListener('click', ()=>speak(ttsTextEl.value.trim(), voiceEl.value||'alloy'));
+document.getElementById('stopTTS').addEventListener('click', stopTTS);
+
+// keep canvas live for ResizeObserver
+scope.addEventListener('click', ()=>{});
+new ResizeObserver(()=>{}).observe(scope);
