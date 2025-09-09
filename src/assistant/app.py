@@ -219,20 +219,65 @@ async def transcribe_audio(file: UploadFile = File(...)):
 async def tts_mp3(req: TTSRequest):
     """
     Returns MP3 bytes the browser <audio> can play.
-    If streaming is supported in the SDK, we stream; otherwise we fall back to a single MP3 blob.
+    Try non-streaming first (widest SDK compatibility), then streaming if available.
     """
-    # Try streaming first
+    text = (req.text or "").strip()
+    voice = (req.voice or "alloy").strip() or "alloy"
+    if not text:
+        return JSONResponse({"error": "Empty text"}, status_code=400)
+
+    # --- Non-streaming first (most compatible) ---
     try:
-        async with client.audio.speech.with_streaming_response.create(
+        res = await client.audio.speech.create(
             model="gpt-4o-mini-tts",
-            voice=req.voice,
-            input=req.text,
+            voice=voice,
+            input=text,
+            format="mp3",
+        )
+        data: Optional[bytes] = None
+
+        # Handle multiple SDK response shapes
+        if hasattr(res, "content") and isinstance(res.content, (bytes, bytearray)):
+            data = bytes(res.content)
+        elif hasattr(res, "read"):
+            data = await res.read()
+        elif isinstance(res, (bytes, bytearray)):
+            data = bytes(res)
+
+        if data:
+            return Response(
+                content=data,
+                media_type="audio/mpeg",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": 'inline; filename="speech.mp3"',
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        # If we got here, try streaming path next
+    except Exception as e:
+        # Log on server for debugging, but fall through to streaming attempt
+        print(f"[tts non-streaming error] {type(e).__name__}: {e}")
+
+    # --- Streaming fallback (best-effort; some SDKs differ) ---
+    try:
+        # Some SDKs expose with_streaming_response; others have different names.
+        ws = getattr(getattr(client.audio.speech, "with_streaming_response", None), "create", None)
+        if not callable(ws):
+            raise RuntimeError("Streaming API not available in this SDK")
+
+        async with ws(
+            model="gpt-4o-mini-tts",
+            voice=voice,
+            input=text,
             format="mp3",
         ) as resp:
-            async def gen() -> AsyncIterator[bytes]:
+
+            async def gen():
                 async for chunk in resp.iter_bytes():
                     if chunk:
                         yield chunk
+
             return StreamingResponse(
                 gen(),
                 media_type="audio/mpeg",
@@ -242,44 +287,10 @@ async def tts_mp3(req: TTSRequest):
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-    except AttributeError:
-        # SDK has no streaming path — fall through to non-streaming
-        pass
-    except Exception:
-        # Any streaming failure — try non-streaming
-        pass
-
-    # Non-streaming fallback
-    try:
-        res = await client.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice=req.voice,
-            input=req.text,
-            format="mp3",
-        )
-        data: Optional[bytes] = None
-
-        if hasattr(res, "content") and isinstance(res.content, (bytes, bytearray)):
-            data = bytes(res.content)
-        if data is None and hasattr(res, "read"):
-            data = await res.read()
-        if data is None and isinstance(res, (bytes, bytearray)):
-            data = bytes(res)
-
-        if not data:
-            raise RuntimeError("Empty TTS response")
-
-        return Response(
-            content=data,
-            media_type="audio/mpeg",
-            headers={
-                "Cache-Control": "no-store",
-                "Content-Disposition": 'inline; filename="speech.mp3"',
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
     except Exception as e:
+        print(f"[tts streaming error] {type(e).__name__}: {e}")
         return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
+
 
 @api.post("/tts/stop")
 async def stop_tts():
