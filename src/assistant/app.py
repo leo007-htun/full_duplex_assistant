@@ -160,8 +160,22 @@ async def determine_intent(msg: ChatMessage):
 # =========================================================
 @api.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    if file.content_type not in {"audio/webm", "audio/mpeg", "audio/wav", "audio/mp4", "audio/x-m4a"}:
-        return JSONResponse({"error": f"Unsupported content type: {file.content_type}"}, status_code=415)
+    # Normalize content type (drop parameters like ;codecs=opus)
+    raw_ct = (file.content_type or "application/octet-stream").lower()
+    base_ct = raw_ct.split(";")[0].strip()
+
+    # Accept common browser recorder types (Chrome/Edge = webm, Firefox = ogg)
+    allowed = {
+        "audio/webm",
+        "audio/ogg",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/mp4",
+        "audio/x-m4a",
+        "application/octet-stream",  # fallback
+    }
+    if base_ct not in allowed:
+        return JSONResponse({"error": f"Unsupported content type: {raw_ct}"}, status_code=415)
 
     audio_bytes = await file.read()
     if not audio_bytes:
@@ -169,17 +183,34 @@ async def transcribe_audio(file: UploadFile = File(...)):
     if len(audio_bytes) > 25 * 1024 * 1024:
         return JSONResponse({"error": "File too large (25MB)."}, status_code=413)
 
-    filename = file.filename or "input.webm"
-    mimetype = file.content_type or "application/octet-stream"
+    # Pick a reasonable filename/extension for the transcription API
+    # Respect client filename if present; otherwise derive from content type
+    name = (file.filename or "").strip() or "input"
+    ext_map = {
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "application/octet-stream": "",  # unknown; leave as-is
+    }
+    # If filename has no ext, add one from base_ct
+    if "." not in name and base_ct in ext_map:
+        name += ext_map[base_ct]
+
+    # Use base content-type (without codecs) when uploading
+    mimetype = base_ct if base_ct in ext_map else "application/octet-stream"
 
     try:
         resp = await client.audio.transcriptions.create(
-            file=(filename, io.BytesIO(audio_bytes), mimetype),
+            file=(name, io.BytesIO(audio_bytes), mimetype),
             model="gpt-4o-transcribe",
         )
         return {"text": resp.text}
     except Exception as e:
         return JSONResponse({"error": f"Transcription failed: {e}"}, status_code=500)
+
 
 # =========================================================
 # Browser-playback TTS (MP3), with instant stop support
