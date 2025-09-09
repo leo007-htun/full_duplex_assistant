@@ -4,8 +4,7 @@ services:
   init_letsencrypt:
     image: alpine:3.20
     command: sh -c "mkdir -p /letsencrypt && touch /letsencrypt/acme.json && chmod 600 /letsencrypt/acme.json"
-    volumes:
-      - ./letsencrypt:/letsencrypt
+    volumes: [ "./letsencrypt:/letsencrypt" ]
     restart: "no"
 
   traefik:
@@ -33,15 +32,15 @@ services:
       - "443:443"
       - "8080:8080"
     volumes:
-      - ./letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [web]
+      - "./letsencrypt:/letsencrypt"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks: [ web ]
     restart: unless-stopped
 
   web:
     image: nginx:alpine
     volumes:
-      - ./web:/usr/share/nginx/html:ro
+      - "./web:/usr/share/nginx/html:ro"
     labels:
       - traefik.enable=true
       - traefik.docker.network=full_duplex_web
@@ -50,7 +49,7 @@ services:
       - traefik.http.routers.web.tls.certresolver=letsencrypt
       - traefik.http.routers.web.priority=1
       - traefik.http.services.web.loadbalancer.server.port=80
-    networks: [web]
+    networks: [ web ]
     restart: unless-stopped
 
   assistant:
@@ -58,8 +57,9 @@ services:
       context: .
       dockerfile: src/assistant/utils/Dockerfile
     container_name: full_duplex_assistant_1
+    working_dir: /app
     volumes:
-      - ./src:/app
+      - ./src:/app             # your code lives at /app/assistant/...
     env_file:
       - ./src/assistant/.env
     environment:
@@ -75,13 +75,22 @@ services:
       - traefik.http.routers.assistant.tls.certresolver=letsencrypt
       - traefik.http.routers.assistant.priority=100
       - traefik.http.services.assistant.loadbalancer.server.port=8000
-    networks: [web]
+    networks: [ web ]
     restart: unless-stopped
+    # ✅ robust healthcheck that doesn’t require curl
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport sys,urllib.request\n"\
+          "url='http://127.0.0.1:8000/openapi.json'\n"\
+          "try:\n  sys.exit(0 if urllib.request.urlopen(url,timeout=3).status==200 else 1)\n"\
+          "except Exception:\n  sys.exit(1)\nPY"
+        ]
+      interval: 20s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
 
 networks:
   web:
