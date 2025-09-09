@@ -149,7 +149,22 @@ async function onSpeechStart(){
     try { recorder = new MediaRecorder(stream, { mimeType }); }
     catch { recorder = new MediaRecorder(stream); }
     recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-    recorder.onstop = () => { if (chunks.length) uploadChunk(recorder.mimeType || mimeType); };
+    recorder.onstop = () => {
+      try {
+        if (!chunks.length) {
+          log('[onstop] No chunks collected — skipping upload.');
+          return;
+        }
+        const mt = recorder.mimeType || mimeType || 'audio/webm';
+        uploadChunk(mt).catch(e => {
+          log('[onstop->uploadChunk] error:', e?.stack || e?.message || e);
+          toast('Upload failed', 'bad');
+        });
+      } catch (e) {
+        log('[onstop] handler error:', e?.stack || e?.message || e);
+      }
+    };
+
     recorder.start(150); // ~150ms chunks
     recording = true;
     micState.textContent = 'recording';
@@ -180,43 +195,75 @@ function chooseMime() {
 }
 
 // ===== Upload, then LLM, then TTS back =====
-async function uploadChunk(mimeType){
-  try{
-    const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-    chunks = [];
-    if (!blob.size) return;
+async function uploadChunk(mimeType) {
+  // 0) Defensive checks
+  if (!chunks || !chunks.length) {
+    log('[uploadChunk] No chunks to upload.');
+    return;
+  }
 
-    const ext = (mimeType?.split?.('/')[1] || 'webm').split(';')[0] || 'webm';
-    const fd = new FormData();
-    fd.append('file', blob, `input.${ext}`);
+  const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+  chunks = []; // free mem
+  if (!blob.size) {
+    log('[uploadChunk] Empty blob. Likely VAD stopped too fast or mic muted.');
+    return;
+  }
 
-    // 1) STT
-    const r = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
-    const textBody = await r.text();
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText} ${textBody}`);
-    const data = JSON.parse(textBody);
-    const text = (data.text || '').trim();
-    transcriptEl.textContent = text;
-    if (!text) return;
+  // 1) Build form-data with safe extension
+  const ext = (mimeType?.split?.('/')[1] || 'webm').split(';')[0] || 'webm';
+  const fd = new FormData();
+  fd.append('file', blob, `input.${ext}`);
 
-    // 2) LLM (intent router)
-    const ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
+  // 2) POST to /transcribe with explicit status handling
+  let r;
+  try {
+    r = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
+  } catch (e) {
+    // Network error or AbortError (barge-in while sending)
+    throw new Error(`[transcribe] network error: ${e?.name || ''} ${e?.message || e}`);
+  }
+
+  const raw = await r.text();
+  if (!r.ok) {
+    // Show *exact* server response to debug (415/404/500)
+    throw new Error(`[transcribe] ${r.status} ${r.statusText} — ${raw}`);
+  }
+
+  let data;
+  try { data = JSON.parse(raw); }
+  catch (e) { throw new Error(`[transcribe] Non-JSON response: ${raw.slice(0,200)}`); }
+
+  const text = (data.text || '').trim();
+  log('[STT OK]', { mimeType, ext, len: blob.size, text });
+  transcriptEl.textContent = text;
+  if (!text) return;
+
+  // 3) Intent routing
+  let ir;
+  try {
+    ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ message: text })
     });
-    const iText = await ir.text();
-    if (!ir.ok) throw new Error(`${ir.status} ${ir.statusText} ${iText}`);
-    const intent = JSON.parse(iText);
-    const reply = (intent.result || '').trim();
-    if (!reply) return;
-
-    // 3) Speak reply (abortable)
-    await speak(reply, voiceEl.value || 'alloy');
-  }catch(e){
-    log('Transcribe/LLM failed:', e?.message || e);
-    toast('Speech failed','bad');
+  } catch (e) {
+    throw new Error(`[intent] network error: ${e?.name || ''} ${e?.message || e}`);
   }
+
+  const iRaw = await ir.text();
+  if (!ir.ok) throw new Error(`[intent] ${ir.status} ${ir.statusText} — ${iRaw}`);
+
+  let intent;
+  try { intent = JSON.parse(iRaw); }
+  catch (e) { throw new Error(`[intent] Non-JSON response: ${iRaw.slice(0,200)}`); }
+
+  const reply = (intent.result || '').trim();
+  log('[INTENT OK]', intent.intent, '→', reply);
+  if (!reply) return;
+
+  // 4) TTS (abortable). If VAD fires again, another onSpeechStart() will abort this.
+  await speak(reply, voiceEl.value || 'alloy');
 }
+
 
 // ===== Mic start/stop =====
 async function start(){
