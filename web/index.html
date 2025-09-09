@@ -1,117 +1,204 @@
-<!doctype html>
-<html lang="en" class="h-full">
-<head>
-  <meta charset="utf-8" />
-  <title>COM Cloud • Full-Duplex Assistant</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <style>
-    :root{
-      --bg:#0b0f14; --panel:#0f1520; --panel-2:#0c1118; --text:#e8f0ff; --muted:#9fb0c6;
-      --brand:#4cc9f0; --accent:#22d3ee; --border:rgba(255,255,255,.08); --radius:16px;
-      --ok:#10b981; --warn:#f59e0b; --bad:#ef4444;
+// ===== Basic config =====
+const ORIGIN = location.origin;
+let API_PREFIX = '/api';
+(async () => {
+  for (const p of ['/api', '']) {
+    try {
+      const r = await fetch(`${ORIGIN}${p}/healthz`);
+      if (r.ok) { API_PREFIX = p; break; }
+    } catch {}
+  }
+})();
+
+// ===== UI =====
+const startBtn = document.getElementById('start');
+const stopBtn  = document.getElementById('stop');
+const transcriptEl = document.getElementById('transcript');
+const player = document.getElementById('player');
+
+// ===== State machine =====
+const State = Object.freeze({ IDLE:'idle', LISTENING:'listening', THINKING:'thinking', SPEAKING:'speaking' });
+let state = State.IDLE;
+
+// ===== Audio graph + VAD =====
+let ctx, analyser, stream, source, rafId;
+let recorder, chunks = [], recording=false;
+let vadSpeaking = false, vadSilenceSince = 0;
+let noiseFloor = 0.01;
+const VAD_HANGOVER_MS = 300;
+const VAD_BASE = 0.02;
+
+// ===== TTS control (hard barge-in) =====
+let ttsAbort = null;
+let ttsBlobURL = '';
+let ttsPlaying = false;
+player.addEventListener('playing', () => ttsPlaying = true);
+player.addEventListener('ended',   () => ttsPlaying = false);
+player.addEventListener('pause',   () => ttsPlaying = false);
+
+function stopTTSLocal() {
+  try { player.pause(); } catch {}
+  ttsPlaying = false;
+  if (ttsAbort && !ttsAbort.signal.aborted) try { ttsAbort.abort(); } catch {}
+  ttsAbort = null;
+  if (ttsBlobURL) { URL.revokeObjectURL(ttsBlobURL); ttsBlobURL = ''; }
+}
+async function stopTTSServer() {
+  try { await fetch(`${ORIGIN}${API_PREFIX}/tts/stop`, { method:'POST' }); } catch {}
+}
+async function bargeIn() {
+  // stop TTS immediately (network + audio + server)
+  stopTTSLocal();
+  stopTTSServer();
+}
+
+// ===== Mic start/stop =====
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true } });
+  ctx = new (window.AudioContext||window.webkitAudioContext)();
+  analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+  source = ctx.createMediaStreamSource(stream); source.connect(analyser);
+  state = State.LISTENING;
+  draw();
+  startBtn.disabled = true; stopBtn.disabled = false;
+}
+function stop() {
+  cancelAnimationFrame(rafId);
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  if (ctx?.state !== 'closed') ctx?.close();
+  state = State.IDLE;
+  startBtn.disabled = false; stopBtn.disabled = true;
+}
+
+// ===== VAD loop =====
+async function draw() {
+  const data = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(data);
+  let sum=0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+  const energy = Math.sqrt(sum/data.length);
+  noiseFloor = 0.98*noiseFloor + 0.02*energy;
+  const dynThresh = Math.max(VAD_BASE, noiseFloor*2.2);
+
+  const now = performance.now();
+  // While TTS plays, demand stronger sustained energy to barge-in (reduce echo false-positives)
+  const requireFactor = ttsPlaying ? 2.2 : 1.0;
+  const isSpeech = energy >= dynThresh * requireFactor;
+
+  if (isSpeech) {
+    if (!vadSpeaking) onSpeechStart();
+    vadSpeaking = true; vadSilenceSince = 0;
+  } else if (vadSpeaking) {
+    if (!vadSilenceSince) vadSilenceSince = now;
+    if (now - vadSilenceSince > VAD_HANGOVER_MS) {
+      onSpeechEnd();
+      vadSpeaking = false; vadSilenceSince = 0;
     }
-    *{box-sizing:border-box} html,body{height:100%}
-    body{
-      margin:0; color:var(--text);
-      background:
-        radial-gradient(1200px 800px at 80% -10%, rgba(67,97,238,.15), transparent 50%),
-        radial-gradient(1000px 600px at -10% 110%, rgba(76,201,240,.12), transparent 50%),
-        var(--bg);
-      font:16px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  }
+  rafId = requestAnimationFrame(draw);
+}
+
+async function onSpeechStart(){
+  // HARD barge-in: kill any playing TTS ASAP
+  await bargeIn();
+
+  // Start recorder if needed
+  if (!recording) {
+    chunks = [];
+    const mime = pickMime();
+    try { recorder = new MediaRecorder(stream, { mimeType: mime }); }
+    catch { recorder = new MediaRecorder(stream); }
+    recorder.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+    recorder.onstop = onUtteranceComplete;
+    recorder.start(150); // ~150ms chunks
+    recording = true;
+    state = State.LISTENING;
+  }
+}
+
+function onSpeechEnd(){
+  if (recording && recorder && recorder.state !== 'inactive') {
+    recorder.stop();
+    recording = false;
+  }
+}
+
+function pickMime(){
+  const prefs = [
+    'audio/webm;codecs=opus', 'audio/webm',
+    'audio/ogg;codecs=opus',  'audio/ogg',
+    'audio/mp4', 'audio/mpeg'
+  ];
+  for (const m of prefs) if (MediaRecorder.isTypeSupported?.(m)) return m;
+  return '';
+}
+
+// ===== End of utterance → STT → intent → TTS =====
+async function onUtteranceComplete() {
+  try {
+    const mime = recorder.mimeType || 'audio/webm';
+    const blob = new Blob(chunks, { type: mime });
+    chunks = [];
+    if (!blob.size) return;
+
+    // STT
+    state = State.THINKING;
+    const ext = (mime.split('/')[1] || 'webm').split(';')[0] || 'webm';
+    const fd = new FormData(); fd.append('file', blob, `input.${ext}`);
+    const tr = await fetch(`${ORIGIN}${API_PREFIX}/transcribe`, { method:'POST', body: fd });
+    const ttext = await tr.text();
+    if (!tr.ok) throw new Error(`STT ${tr.status} ${ttext}`);
+    const { text } = JSON.parse(ttext);
+    transcriptEl.textContent = text || '';
+    if (!text?.trim()) { state = State.LISTENING; return; }
+
+    // Intent → routing → text response
+    const ir = await fetch(`${ORIGIN}${API_PREFIX}/determine_intent`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ message: text })
+    });
+    const ibody = await ir.text();
+    if (!ir.ok) throw new Error(`Intent ${ir.status} ${ibody}`);
+    const intent = JSON.parse(ibody);
+    const reply = (intent.result || '').trim();
+    if (!reply) { state = State.LISTENING; return; }
+
+    // TTS (abortable)
+    await speak(reply);
+  } catch (e) {
+    console.error('Pipeline error:', e);
+    state = State.LISTENING;
+  }
+}
+
+async function speak(text, voice='alloy') {
+  state = State.SPEAKING;
+  stopTTSLocal();               // ensure clean start
+  ttsAbort = new AbortController();
+  try {
+    // Make sure AudioContext is active (Chrome sometimes suspends it)
+    try { if (ctx && ctx.state === 'suspended') await ctx.resume(); } catch {}
+    const r = await fetch(`${ORIGIN}${API_PREFIX}/tts`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ text, voice }),
+      signal: ttsAbort.signal
+    });
+    if (!r.ok) {
+      const b = await r.text(); throw new Error(`TTS ${r.status} ${b}`);
     }
-    .wrap{max-width:1100px; margin:0 auto; padding:40px 20px 80px}
-    .header{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:24px}
-    .logo{display:flex; gap:10px; align-items:center; font-weight:700}
-    .dot{width:10px; height:10px; border-radius:50%; background:conic-gradient(from 0deg, var(--brand), var(--accent))}
-    .badge{font-size:12px; padding:6px 10px; border:1px solid var(--border); color:var(--muted);
-      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border-radius:999px}
-    .grid{display:grid; grid-template-columns:1.1fr .9fr; gap:20px}
-    .panel{background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border:1px solid var(--border); border-radius:16px}
-    .panel .hd{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border)}
-    .panel .bd{padding:14px}
-    .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
-    .btn{border:1px solid var(--border); color:var(--text); background:#0c1118; padding:10px 12px; border-radius:12px; cursor:pointer}
-    .btn.primary{background:linear-gradient(180deg, rgba(76,201,240,.18), rgba(67,97,238,.14)); border-color:rgba(76,201,240,.35)}
-    .btn.warn{border-color:rgba(245,158,11,.4); background:linear-gradient(180deg, rgba(245,158,11,.12), rgba(245,158,11,.06))}
-    textarea, select{background:#0c1118; color:var(--text); border:1px solid var(--border); border-radius:12px; outline:none}
-    textarea{width:100%; min-height:120px; padding:12px}
-    select{padding:10px 12px}
-    .canvas{width:100%; height:72px; border:1px solid var(--border); border-radius:10px}
-    .bar{height:8px; border-radius:8px; background:linear-gradient(90deg, #1f2a3a, #17202c); overflow:hidden; border:1px solid var(--border)}
-    .fill{height:100%; width:0%; background:linear-gradient(90deg, var(--brand), var(--accent)); transition:width .06s linear}
-    .log{height:140px; overflow:auto; white-space:pre-wrap; padding:10px; border-radius:10px; border:1px solid var(--border); background:#0c1118; font-size:12px; color:#cfe4ff}
-    .muted{color:#9fb0c6}
-    .chip{display:inline-flex; gap:6px; align-items:center; padding:6px 10px; border-radius:999px; border:1px dashed var(--border); color:#9fb0c6; font-size:12px}
-    .ok{color:#10b981} .warn{color:#f59e0b} .bad{color:#ef4444}
-    .toast{position:fixed; right:20px; bottom:20px; background:#0f1520; border:1px solid var(--border); border-radius:12px; padding:10px 12px; display:none; min-width:240px}
-    .toast.show{display:block; animation:in .25s ease}
-    @keyframes in{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:translateY(0)}}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="header">
-      <div class="logo"><div class="dot"></div><div>COM Cloud <span class="muted">• Full-Duplex Assistant</span></div></div>
-      <div class="row">
-        <span class="badge">Status: <b id="status" class="ok">Online</b></span>
-        <span class="badge">API: <span id="api" class="muted">/api</span></span>
-      </div>
-    </div>
+    const buf = await r.arrayBuffer();
+    const blob = new Blob([buf], { type:'audio/mpeg' });
+    ttsBlobURL = URL.createObjectURL(blob);
+    player.src = ttsBlobURL; player.load();
+    try { await player.play(); } catch {}
+    // When playback ends naturally, go back to listening
+    player.onended = () => { state = State.LISTENING; };
+  } catch (e) {
+    if (e.name !== 'AbortError') console.error('TTS error:', e);
+    state = State.LISTENING;
+  }
+}
 
-    <div class="grid">
-      <div class="panel">
-        <div class="hd">
-          <div>Realtime Mic + VAD</div>
-          <div class="row">
-            <span class="chip">Mic <span id="micState" class="muted">idle</span></span>
-            <span class="chip">VAD <span id="vadState" class="muted">ready</span></span>
-          </div>
-        </div>
-        <div class="bd">
-          <div class="row" style="margin-bottom:10px">
-            <button id="start" class="btn primary">🎙 Start</button>
-            <button id="stop" class="btn warn" disabled>⏹ Stop</button>
-            <div class="bar" style="flex:1"><div id="level" class="fill"></div></div>
-            <select id="mime">
-              <option value="audio/webm" selected>audio/webm</option>
-              <option value="audio/wav">audio/wav</option>
-              <option value="audio/mp4">audio/mp4</option>
-            </select>
-          </div>
-          <canvas id="scope" class="canvas"></canvas>
-          <div style="margin-top:12px"><strong>Transcript</strong>
-            <div id="transcript" class="log"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="hd">
-          <div>Speech Synthesis</div>
-          <div class="row"><span class="chip">Codec mp3</span></div>
-        </div>
-        <div class="bd">
-          <label class="muted">Text</label>
-          <textarea id="ttsText">Hi! Start talking anytime — TTS will cut off instantly. 🔇➡️🎙</textarea>
-          <div class="row" style="margin-top:10px">
-            <select id="voice">
-              <option value="alloy" selected>alloy</option>
-              <option value="aria">aria</option>
-              <option value="verse">verse</option>
-              <option value="nova">nova</option>
-            </select>
-            <button id="speak" class="btn primary">🔊 Speak</button>
-            <button id="stopTTS" class="btn">🛑 Stop TTS</button>
-          </div>
-          <audio id="player" controls style="width:100%; margin-top:10px"></audio>
-          <div style="margin-top:12px"><strong>Log</strong><div id="log" class="log"></div></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="toast" class="toast"></div>
-  <script type="module" src="./app.js"></script>
-</body>
-</html>
+// ===== UI =====
+startBtn.onclick = start;
+stopBtn.onclick  = stop;
