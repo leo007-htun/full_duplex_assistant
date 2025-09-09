@@ -215,81 +215,73 @@ async def transcribe_audio(file: UploadFile = File(...)):
 # =========================================================
 # Browser-playback TTS (MP3), with instant stop support
 # =========================================================
+
 @api.post("/tts")
 async def tts_mp3(req: TTSRequest):
     """
-    Returns MP3 bytes the browser <audio> can play.
-    Try non-streaming first (widest SDK compatibility), then streaming if available.
+    Return MP3 bytes for the browser. Tries multiple param names
+    ('format' / 'response_format' / 'audio_format') so it works across SDKs.
     """
     text = (req.text or "").strip()
     voice = (req.voice or "alloy").strip() or "alloy"
     if not text:
         return JSONResponse({"error": "Empty text"}, status_code=400)
 
-    # --- Non-streaming first (most compatible) ---
-    try:
-        res = await client.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-            format="mp3",
+    async def _non_streaming_tts(model: str, voice: str, text: str) -> Optional[bytes]:
+        # Try common kwarg variants
+        variants = (
+            {"format": "mp3"},
+            {"response_format": "mp3"},
+            {"audio_format": "mp3"},
+            {},  # some wrappers default to mp3 with no explicit arg
         )
-        data: Optional[bytes] = None
+        last_err = None
+        for extra in variants:
+            try:
+                res = await client.audio.speech.create(
+                    model=model,
+                    voice=voice,
+                    input=text,
+                    **extra,
+                )
+                data = None
+                if hasattr(res, "content") and isinstance(res.content, (bytes, bytearray)):
+                    data = bytes(res.content)
+                elif hasattr(res, "read"):
+                    data = await res.read()
+                elif isinstance(res, (bytes, bytearray)):
+                    data = bytes(res)
+                if data:
+                    return data
+            except TypeError as e:
+                # e.g., "unexpected keyword argument 'format'"
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                break
+        if last_err:
+            raise last_err
+        return None
 
-        # Handle multiple SDK response shapes
-        if hasattr(res, "content") and isinstance(res.content, (bytes, bytearray)):
-            data = bytes(res.content)
-        elif hasattr(res, "read"):
-            data = await res.read()
-        elif isinstance(res, (bytes, bytearray)):
-            data = bytes(res)
-
-        if data:
-            return Response(
-                content=data,
-                media_type="audio/mpeg",
-                headers={
-                    "Cache-Control": "no-store",
-                    "Content-Disposition": 'inline; filename="speech.mp3"',
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
-        # If we got here, try streaming path next
-    except Exception as e:
-        # Log on server for debugging, but fall through to streaming attempt
-        print(f"[tts non-streaming error] {type(e).__name__}: {e}")
-
-    # --- Streaming fallback (best-effort; some SDKs differ) ---
     try:
-        # Some SDKs expose with_streaming_response; others have different names.
-        ws = getattr(getattr(client.audio.speech, "with_streaming_response", None), "create", None)
-        if not callable(ws):
-            raise RuntimeError("Streaming API not available in this SDK")
-
-        async with ws(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-            format="mp3",
-        ) as resp:
-
-            async def gen():
-                async for chunk in resp.iter_bytes():
-                    if chunk:
-                        yield chunk
-
-            return StreamingResponse(
-                gen(),
-                media_type="audio/mpeg",
-                headers={
-                    "Cache-Control": "no-store",
-                    "Content-Disposition": 'inline; filename="speech.mp3"',
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
+        data = await _non_streaming_tts("gpt-4o-mini-tts", voice, text)
+        if not data:
+            raise RuntimeError("TTS returned no audio bytes")
+        return Response(
+            content=data,
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'inline; filename="speech.mp3"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     except Exception as e:
-        print(f"[tts streaming error] {type(e).__name__}: {e}")
+        # Log for server diagnostics
+        print(f"[/api/tts] error: {type(e).__name__}: {e}")
         return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
+
 
 
 @api.post("/tts/stop")
