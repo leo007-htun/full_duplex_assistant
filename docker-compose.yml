@@ -79,14 +79,9 @@ services:
     restart: unless-stopped
     # ✅ robust healthcheck that doesn’t require curl
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python - <<'PY'\nimport sys,urllib.request\n"\
-          "url='http://127.0.0.1:8000/openapi.json'\n"\
-          "try:\n  sys.exit(0 if urllib.request.urlopen(url,timeout=3).status==200 else 1)\n"\
-          "except Exception:\n  sys.exit(1)\nPY"
-        ]
+      test: >
+        CMD-SHELL python -c "import sys, urllib.request;
+        sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3).status == 200 else 1)"
       interval: 20s
       timeout: 5s
       start_period: 25s
