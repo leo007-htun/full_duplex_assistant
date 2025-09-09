@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ENABLE_VOICE=0 \
     PYTHONPATH=/app/src
 
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc python3-dev \
     curl ca-certificates \
@@ -17,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# 🔑 Include python-multipart for FastAPI file uploads
 RUN pip install --no-cache-dir \
     fastapi==0.110.0 \
     "uvicorn[standard]==0.23.2" \
@@ -28,12 +30,15 @@ RUN pip install --no-cache-dir \
     pyaudio==0.2.13 \
     playwright==1.40.0 \
     openai==1.97.0 \
+    python-multipart==0.0.9 \
     "httpx<0.28"
 
+# (Large) browser deps for Playwright
 RUN python -m playwright install --with-deps
 
 COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "assistant.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Using python -m uvicorn is a bit more robust w.r.t. PATH
+CMD ["python", "-m", "uvicorn", "assistant.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
