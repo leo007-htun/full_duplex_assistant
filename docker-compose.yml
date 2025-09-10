@@ -25,12 +25,15 @@ services:
       - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
       - --log.level=DEBUG
       - --accesslog=true
+      # NOTE: disable insecure dashboard in prod; keep while testing:
       - --api.dashboard=true
       - --api.insecure=true
+      # Optional: longer timeouts for long-lived connections
+      # - --serversTransport.forwardingTimeouts.readTimeout=3600s
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"
+      - "8080:8080"   # dashboard (remove in prod)
     volumes:
       - "./letsencrypt:/letsencrypt"
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
@@ -44,7 +47,8 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=full_duplex_web
-      - traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && !PathPrefix(`/api`) && !PathPrefix(`/ws`)
+      # Exclude /api, /ws, and /rt-token from static site
+      - traefik.http.routers.web.rule=Host(`com-cloud.cloud`) && !PathPrefix(`/api`) && !PathPrefix(`/ws`) && !PathPrefix(`/rt-token`)
       - traefik.http.routers.web.entrypoints=websecure
       - traefik.http.routers.web.tls.certresolver=letsencrypt
       - traefik.http.routers.web.priority=1
@@ -59,7 +63,7 @@ services:
     container_name: full_duplex_assistant_1
     working_dir: /app
     volumes:
-      - ./src:/app             # your code lives at /app/assistant/...
+      - ./src:/app
     env_file:
       - ./src/assistant/.env
     environment:
@@ -70,21 +74,26 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=full_duplex_web
-      - traefik.http.routers.assistant.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)
-      - traefik.http.routers.assistant.entrypoints=websecure
-      - traefik.http.routers.assistant.tls.certresolver=letsencrypt
-      - traefik.http.routers.assistant.priority=100
+      # API router -> FastAPI
+      - traefik.http.routers.assistant_api.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)
+      - traefik.http.routers.assistant_api.entrypoints=websecure
+      - traefik.http.routers.assistant_api.tls.certresolver=letsencrypt
+      - traefik.http.routers.assistant_api.priority=100
       - traefik.http.services.assistant.loadbalancer.server.port=8000
+      # Token router -> FastAPI (/rt-token)
+      - traefik.http.routers.assistant_token.rule=Host(`com-cloud.cloud`) && PathPrefix(`/rt-token`)
+      - traefik.http.routers.assistant_token.entrypoints=websecure
+      - traefik.http.routers.assistant_token.tls.certresolver=letsencrypt
+      - traefik.http.routers.assistant_token.priority=110
+      # (Traefik handles WS upgrade headers automatically)
     networks: [ web ]
     restart: unless-stopped
-    # ✅ robust healthcheck that doesn’t require curl
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).status==200 else 1)"]
       interval: 20s
       timeout: 5s
       start_period: 25s
       retries: 3
-
 
 networks:
   web:
