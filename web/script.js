@@ -293,7 +293,6 @@ document.addEventListener("DOMContentLoaded", () => {
     controls.enableDamping = true; controls.dampingFactor = 0.08;
     controls.enableZoom = false;
 
-    // Lights
     scene.add(new THREE.AmbientLight(0x88aabb, 1.2));
     const dl = new THREE.DirectionalLight(0xffffff, 1.2); dl.position.set(3,2,2); scene.add(dl);
     const p1 = new THREE.PointLight(0x66e6ff, 1.1, 10); p1.position.set(2,2,2); scene.add(p1);
@@ -403,7 +402,7 @@ document.addEventListener("DOMContentLoaded", () => {
           vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;
           vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
           vec3 p0=vec3(a0.xy,h.x);
-          vec3 p1=vec3(a0.zw,h.y);
+          vec3 p1=vec3(a1.zw,h.y);
           vec3 p2=vec3(a1.xy,h.z);
           vec3 p3=vec3(a1.zw,h.w);
           vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
@@ -522,20 +521,59 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   /* ===========================
-     REAL-TIME TRANSCRIPTION (OpenAI Realtime)
+     REALTIME (ASR) + TTS
   ============================ */
+
+  // Where to reach the API in dev/prod
+  const API_BASE = (() => {
+    const isLocal = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    if (isLocal && location.port === "5500") return "http://127.0.0.1:8000"; // dev: live-server -> uvicorn
+    return ""; // prod: same-origin behind Traefik
+  })();
+
+  const TOKEN_ENDPOINT = API_BASE ? `${API_BASE}/rt-token` : `/api/rt-token`;
+  const TTS_BASE      = API_BASE ? `${API_BASE}/api/tts/stream` : `/api/tts/stream`;
+
   const transcriptEl = document.getElementById("transcript-stream");
+
+  // Realtime WS
   let ws = null;
   let wsOpen = false;
-  let captureNode = null;
-  let appendedMsSinceCommit = 0;   // ms of audio appended since last commit
-  let everAppended = false;        // have we appended anything yet?
-  let lastCommitAt = 0;            // to throttle commits
 
-  // Live-server (5500) → FastAPI (8000) token bridge; otherwise same-origin.
-  const TOKEN_URL = (location.hostname === "localhost" || location.hostname === "127.0.0.1")
-    ? "http://127.0.0.1:8000/rt-token"
-    : "/rt-token";
+  // Mic capture node
+  let captureNode = null;
+  let appendedMsSinceCommit = 0;
+  let everAppended = false;
+  let lastCommitAt = 0;
+
+  // TTS player (single <audio>)
+  const TTS_VOICE = "coral";
+  const TTS_FMT   = "wav"; // wav/pcm best latency
+  const ttsAudio  = new Audio();
+  ttsAudio.autoplay = true;
+  ttsAudio.preload  = "none";
+  ttsAudio.addEventListener("error", () => {
+    // Silently ignore; can surface if you want:
+    // notify("TTS ERROR", "error", 1500);
+  });
+
+  function stopSpeak(silent=false){
+    try {
+      ttsAudio.pause();
+      // Kill network stream immediately by clearing src
+      ttsAudio.src = "";
+      ttsAudio.load();
+      if (!silent) notify("TTS INTERRUPTED", "warn", 900);
+    } catch {}
+  }
+
+  function speak(text){
+    if (!text) return;
+    stopSpeak(true);
+    const url = `${TTS_BASE}?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(TTS_VOICE)}&fmt=${encodeURIComponent(TTS_FMT)}`;
+    ttsAudio.src = url;
+    ttsAudio.play().catch(()=>{});
+  }
 
   // helpers: downsample 48k→16k + PCM16 + base64
   function downsampleTo16k(buffer, inRate) {
@@ -594,18 +632,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (frag) frag.remove();
     if (line.textContent) transcriptEl.appendChild(line);
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
+
+    // 🔊 Auto-speak the final text (you can replace with assistant reply later)
+    if (line.textContent) speak(line.textContent);
   }
 
   async function startRealtime(userMediaStream) {
     try {
       // 1) fetch ephemeral token
-      const r = await fetch(TOKEN_URL, { cache: "no-store" });
+      const r = await fetch(TOKEN_ENDPOINT, { cache: "no-store" });
       if (!r.ok) { notify("AUTH HTTP ERROR", "error", 4000); return; }
       const tok = await r.json();
-      const token =
-        tok?.client_secret?.value ||
-        tok?.client_secret ||
-        tok?.value;
+      const token = tok?.client_secret?.value || tok?.client_secret || tok?.value;
       if (!token) { notify("AUTH MISSING TOKEN", "error", 4000); return; }
 
       // 2) connect WS
@@ -623,14 +661,14 @@ document.addEventListener("DOMContentLoaded", () => {
         lastCommitAt = performance.now();
         notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
-        // 3) configure session (server VAD + transcription model)
+        // Session config (server VAD + model)
         ws.send(JSON.stringify({
           type: "session.update",
           session: {
             input_audio_format: "pcm16",
             input_audio_transcription: {
-              model: "gpt-4o-mini-transcribe" // or "gpt-4o-transcribe"
-              // language: "en" // optional: set if you know the language
+              model: "gpt-4o-mini-transcribe"
+              // language: "en"
             },
             turn_detection: {
               type: "server_vad",
@@ -639,19 +677,23 @@ document.addEventListener("DOMContentLoaded", () => {
               silence_duration_ms: 500
             },
             input_audio_noise_reduction: { type: "near_field" }
-            // include: ["item.input_audio_transcription.logprobs"] // optional
           }
         }));
 
-        // 4) begin mic streaming
+        // begin mic streaming
         startMicPCMStream(userMediaStream);
       };
 
       ws.onmessage = (ev) => {
         let msg; try { msg = JSON.parse(ev.data); } catch { return; }
         const t = msg.type;
+
+        // 🔇 If server VAD hears new speech → hard barge-in TTS
+        if (t === "input_audio_buffer.speech_started") {
+          stopSpeak(true);
+        }
+
         if (t === "input_audio_buffer.committed") {
-          // server created a speech chunk; reset our counter
           appendedMsSinceCommit = 0;
         }
 
@@ -676,6 +718,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         if (t === "transcription.speech_stopped") {
+          // Encourage the server to finalize if it hasn't already
           maybeCommitToServer(true);
         }
 
@@ -709,17 +752,13 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!audioContext) return;
     const inputNode = audioContext.createMediaStreamSource(userMediaStream);
 
-
-    // ScriptProcessor for broad compatibility
     captureNode = audioContext.createScriptProcessor(4096, 1, 1);
     const sink = audioContext.createGain(); sink.gain.value = 0;
     captureNode.connect(sink); sink.connect(audioContext.destination);
     inputNode.connect(captureNode);
 
     const inRate = audioContext.sampleRate;            // ~48000
-    //const frameMs = 100;                               // ~100ms frames
-    //const samplesPerFrame = Math.floor(inRate * 0.1);
-    const frameMs = 220;  // send ~120ms frames so each append is safely >100ms
+    const frameMs = 220;                               // ≥100ms per append
     const samplesPerFrame = Math.floor(inRate * (frameMs / 1000));
 
     let acc = new Float32Array(0);
@@ -727,10 +766,7 @@ document.addEventListener("DOMContentLoaded", () => {
     captureNode.onaudioprocess = (e) => {
       if (!wsOpen || !ws || ws.readyState !== 1) return;
 
-      // read directly from the mic callback
       const input = e.inputBuffer.getChannelData(0);
-
-      // concat into accumulator
       const tmp = new Float32Array(acc.length + input.length);
       tmp.set(acc, 0); tmp.set(input, acc.length);
       acc = tmp;
@@ -751,7 +787,6 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch {}
       }
     };
-
   }
   function stopMicPCMStream() {
     if (captureNode) {
@@ -760,26 +795,23 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Optional: speed up finals using local VAD → commit after silence
-function maybeCommitToServer(force = false) {
-  if (!wsOpen || !ws || ws.readyState !== 1) return;
-  if (!everAppended) return; // don't commit before any audio was sent
+  // Ask server to finalize after silence / throttle commits
+  function maybeCommitToServer(force = false) {
+    if (!wsOpen || !ws || ws.readyState !== 1) return;
+    if (!everAppended) return;
 
-  const now = performance.now();
+    const now = performance.now();
+    if (!force) {
+      if (appendedMsSinceCommit < 120) return;
+      if (now - lastCommitAt < 300) return;
+    }
 
-  // Only commit if we’ve sent ≥120ms since last commit and not too spammy
-  if (!force) {
-    if (appendedMsSinceCommit < 120) return;
-    if (now - lastCommitAt < 300) return; // throttle a bit
+    try {
+      ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      lastCommitAt = now;
+      appendedMsSinceCommit = 0;
+    } catch {}
   }
-
-  try {
-    ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-    lastCommitAt = now;
-    appendedMsSinceCommit = 0;
-  } catch {}
-}
-
 
   /* ===========================
      ANIMATE LOOP
@@ -798,9 +830,13 @@ function maybeCommitToServer(force = false) {
       level = ((sum / freqData.length) / 255) * (audioSensitivity/5);
       drawCircular(); updateRing();
     }
+
+    // 🔇 Local VAD barge-in / finalize
     if (micActive) {
       const change = vadTick();
       if (change === "start") {
+        // user started talking: kill TTS immediately
+        stopSpeak(true);
         const now = performance.now();
         if (now - lastVADEmit > 120) {
           disturbOrb();
@@ -810,14 +846,15 @@ function maybeCommitToServer(force = false) {
       } else if (vadState.speaking) {
         silenceFrames = 0;
       } else {
-        // when locally silent for ~500ms, ask server to finalize
+        // when locally silent for ~500ms, encourage finalization
         silenceFrames++;
-        if (silenceFrames > 30) { // ~30 frames at ~60fps ≈ 500ms
+        if (silenceFrames > 30) { // ~30 frames @60fps ≈ 500ms
           maybeCommitToServer();
           silenceFrames = 0;
         }
       }
     }
+
     updateOrbUniforms && updateOrbUniforms(t, level);
     updateBackground && updateBackground(t);
     if (orbGroup){
@@ -865,8 +902,54 @@ function maybeCommitToServer(force = false) {
       notify("MIC PERMISSION DENIED", "error", 4000);
     }
   }
+  /* === Start mic/realtime on first user gesture (works on phone & desktop) === */
+  function setupUserGestureStart(options = {}) {
+    const target =
+      options.target ||
+      document.getElementById("three-container") ||
+      window; // orb area if present, else whole window
+    const allowKeyboard = options.allowKeyboard ?? true;
 
-  // Start on first click anywhere (or bind to orb if you prefer)
-  window.addEventListener("click", () => { enableMicAndRealtime(); }, { once: true });
+    let started = false;
+
+    const start = async () => {
+      if (started) return;
+      started = true;
+      try {
+        // iOS: resume AudioContext during the gesture
+        if (typeof audioContext !== "undefined" && audioContext && audioContext.state === "suspended") {
+          try { await audioContext.resume(); } catch {}
+        }
+        await enableMicAndRealtime();
+      } catch (err) {
+        // If user denied mic or something failed, let them try again
+        started = false;
+        attach();
+        console.error("[gesture start] failed:", err);
+      }
+    };
+
+    const keyStart = (e) => {
+      if (!allowKeyboard) return;
+      if (e.key === "Enter" || e.key === " ") start();
+    };
+
+    const attach = () => {
+      const oncePassive = { once: true, passive: true };
+      // Pointer = mouse + touch on modern browsers
+      target.addEventListener("pointerdown", start, oncePassive);
+      // Extra safety for older iOS WebKit quirks
+      target.addEventListener("touchend", start, oncePassive);
+      // Keyboard accessibility
+      window.addEventListener("keydown", keyStart, { once: true });
+    };
+
+    attach();
+  }
+
+  // 🔧 Call it after enableMicAndRealtime() is defined:
+  setupUserGestureStart(); 
+  // (Optional) to require tapping the orb area specifically:
+  // setupUserGestureStart({ target: document.getElementById("three-container") });
 
 });
