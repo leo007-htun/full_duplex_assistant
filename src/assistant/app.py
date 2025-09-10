@@ -1,201 +1,219 @@
-import asyncio
-import base64
+# server.py
+import os
 import io
 import json
-import os
-from typing import Dict, List, Optional, AsyncIterator
+import base64
+import asyncio
+from typing import Optional, Dict, List
 
-# 3rd-party
+import httpx
 import websockets
-from fastapi import FastAPI, UploadFile, File, APIRouter
+from dotenv import load_dotenv
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
-from jinja2 import Environment, FileSystemLoader
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, Response
 
-# ✅ Local services (your thin OpenAI client + PCM player)
-from .services.openai_client import client
-from .voice.tts_player import StreamingTTSPlayer
+# OpenAI (async)
+try:
+    from openai import AsyncOpenAI
+except Exception:
+    # Backward compatibility shim if older SDK is installed
+    from openai import AsyncOpenAI  # type: ignore
 
-# =========================================================
-# Config
-# =========================================================
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://com-cloud.cloud").split(",")
-ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
+load_dotenv()  # loads .env from cwd or parents
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in your environment or .env")
+
+# CORS: allow your Live Server origins (adjust as needed)
+ALLOWED_ORIGINS = [
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+]
+extra_origins = os.getenv("ALLOWED_ORIGINS", "")
+if extra_origins:
+    ALLOWED_ORIGINS += [o.strip() for o in extra_origins.split(",") if o.strip()]
 
 app = FastAPI(title="Full-Duplex Assistant")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# All browser calls come under /api
 api = APIRouter(prefix="/api")
 
-# Server-side audio player (interruptible)
-tts_player = StreamingTTSPlayer()
+# OpenAI async client
+oa = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Minimal in-memory convo history (kept short)
-conversation_history: List[Dict[str, str]] = []
-
-# Templates
-PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
-_env = Environment(loader=FileSystemLoader(PROMPT_DIR))
-
-def render_intent_prompt() -> str:
-    return _env.get_template("intent_prompt.j2").render()
-
-def render_system_prompt(session_id: str = "SESSION-001") -> str:
-    return _env.get_template("system_prompt.j2").render(session_id=session_id)
-
-# =========================================================
-# Server-side TTS (PCM to device) — interruptible
-# =========================================================
-async def speak_tts_locally(text: str, voice: str = "nova"):
+# ─────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────
+def _parse_client_secret(payload: dict) -> Optional[str]:
     """
-    Plays TTS through a local audio device (if present).
-    Safe to best-effort: if device missing (Docker), we swallow errors.
+    OpenAI may return:
+      { "client_secret": { "value": "ek_..." } }
+      or
+      { "client_secret": "ek_..." }
     """
-    try:
-        tts_player.stop()
-        async with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-            format="pcm",  # PCM stream for local device
-        ) as response:
-            await tts_player.play_pcm_stream(response)
-    except Exception:
-        # No device in container or SDK mismatch: ignore
-        pass
+    cs = payload.get("client_secret")
+    if isinstance(cs, dict):
+        return cs.get("value")
+    if isinstance(cs, str):
+        return cs
+    return None
 
-# =========================================================
-# Intent classification
-# =========================================================
-async def determine_intent_gpt(message: str) -> Dict[str, str]:
-    system_prompt = render_intent_prompt()
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
-    try:
-        return json.loads(resp.choices[0].message.content)
-    except Exception:
-        return {"intent": "unknown", "reason": "Could not parse GPT response."}
 
-# =========================================================
-# Models
-# =========================================================
-class ChatMessage(BaseModel):
-    message: str
+async def _create_realtime_ephemeral() -> str:
+    """
+    Works with current Realtime API:
+      POST /v1/realtime/sessions  (preferred)
+    Falls back to legacy /v1/realtime/transcription_sessions if present.
+    """
+    base = "https://api.openai.com"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+        "Content-Type": "application/json",
+    }
 
-class TTSRequest(BaseModel):
-    text: str
-    voice: str = "alloy"  # browser playback voice (mp3)
+    async with httpx.AsyncClient(timeout=10) as client:
+        # Try the general sessions endpoint first (no params required)
+        r = await client.post(f"{base}/v1/realtime/sessions", headers=headers, json={})
+        if r.status_code == 200:
+            secret = _parse_client_secret(r.json())
+            if not secret:
+                raise HTTPException(status_code=500, detail="No client_secret in sessions response")
+            return secret
 
-# =========================================================
-# Health + tiny tools
-# =========================================================
-@api.get("/healthz")
+        # If your account has a transcription-specific endpoint enabled, try it
+        r2 = await client.post(f"{base}/v1/realtime/transcription_sessions", headers=headers, json={})
+        if r2.status_code == 200:
+            secret = _parse_client_secret(r2.json())
+            if not secret:
+                raise HTTPException(status_code=500, detail="No client_secret in transcription_sessions response")
+            return secret
+
+        # Bubble up error
+        detail = r.text if r.content else r.reason_phrase
+        raise HTTPException(status_code=r.status_code or 500, detail=f"OpenAI error: {detail}")
+
+
+# ─────────────────────────────────────────────────────────
+# Public endpoints
+# ─────────────────────────────────────────────────────────
+
+@app.get("/rt-token")
+async def rt_token():
+    """
+    Returns ephemeral client secret for the browser Realtime WS:
+      GET /rt-token  -> { "client_secret": { "value": "ek_..." } }
+    Your frontend then connects to:
+      wss://api.openai.com/v1/realtime?intent=transcription
+    with `Authorization: Bearer ek_...` and `OpenAI-Beta: realtime=v1`
+    """
+    secret = await _create_realtime_ephemeral()
+    # Return in the "nested" shape many examples expect
+    return {"client_secret": {"value": secret}}
+
+
+@app.get("/healthz")
 async def healthz():
     return {"ok": True}
 
-@api.get("/weather")
-async def get_weather():
-    # demo tool
-    return {"forecast": "Sunny, 25°C"}
 
-# =========================================================
-# Intent → route → (optionally speak on server) → return text
-# =========================================================
+# ─────────────  Simple intent + chat  ─────────────
+conversation_history: List[Dict[str, str]] = []
+
+INTENT_SYSTEM = (
+    "You are a tiny intent classifier. "
+    "Return JSON with fields intent (weather|smalltalk|web_search|unknown) and reason."
+)
+
+def _system_prompt(session_id: str = "SESSION-001") -> str:
+    return f"You are NEXUS assistant (session {session_id}). Be concise, helpful, sci-fi tone optional."
+
+class ChatMessage(BaseModel):
+    message: str
+
+try:
+    from pydantic import BaseModel  # ensure available
+except Exception:
+    from pydantic.main import BaseModel  # fallback
+
+
 @api.post("/determine_intent")
-async def determine_intent(msg: ChatMessage, request: Request):  # Add request parameter
+async def determine_intent(msg: ChatMessage, request: Request):
     global conversation_history
-    user_text = msg.message
+    user_text = (msg.message or "").strip()
+    if not user_text:
+        return JSONResponse({"error": "Empty message"}, status_code=400)
 
+    # Abort early if client disconnected
+    if await request.is_disconnected():
+        return JSONResponse({"error": "Request aborted"}, status_code=499)
+
+    # 1) classify
+    intent_resp = await oa.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": INTENT_SYSTEM},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
     try:
-        # Check if the client disconnected before we start processing
-        if await request.is_disconnected():
-            return JSONResponse({"error": "Request aborted"}, status_code=499)
-            
-        # 1) classify intent
-        intent_data = await determine_intent_gpt(user_text)
-        intent = intent_data.get("intent", "unknown")
-        reason = intent_data.get("reason", "")
-        
-        # Check again if client disconnected after intent classification
-        if await request.is_disconnected():
-            return JSONResponse({"error": "Request aborted"}, status_code=499)
+        intent_data = json.loads(intent_resp.choices[0].message.content or "{}")
+    except Exception:
+        intent_data = {"intent": "unknown", "reason": "parse_error"}
 
-        # 2) route based on intent
-        if intent == "weather":
-            data = await get_weather()
-            result = f"The forecast is {data['forecast']}."
-        elif intent == "smalltalk":
-            sys_prompt = render_system_prompt("SESSION-001")
-            convo = [{"role": "system", "content": sys_prompt}] + conversation_history
-            convo.append({"role": "user", "content": user_text})
-            
-            # Check if client disconnected before LLM call
-            if await request.is_disconnected():
-                return JSONResponse({"error": "Request aborted"}, status_code=499)
-                
-            chat = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=convo,
-                temperature=0.7,
-            )
-            
-            # Check if client disconnected after LLM call
-            if await request.is_disconnected():
-                return JSONResponse({"error": "Request aborted"}, status_code=499)
-                
-            result = (chat.choices[0].message.content or "").strip()
-            conversation_history += [
-                {"role": "user", "content": user_text},
-                {"role": "assistant", "content": result},
-            ]
-            if len(conversation_history) > 40:
-                conversation_history = conversation_history[-40:]
-        elif intent == "web_search":
-            # stub; you can call your scraper + summarizer here
-            result = "Here's what I found on the web (stub)."
-        else:
-            result = "Hmm, I'm not sure what you mean."
-    
-        # 3) optionally speak on the server device (if you run on a desktop)
-        # This is non-blocking and won't affect the HTTP response
-        asyncio.create_task(speak_tts_locally(result))
-    
-        # 4) return text for the browser to TTS
-        return {"intent": intent, "reason": reason, "result": result}
-        
-    except asyncio.CancelledError:
-        # Request was cancelled/aborted
-        return JSONResponse({"error": "Request cancelled"}, status_code=499)
-        
-    except Exception as e:
-        # Handle other exceptions
-        print(f"Error in determine_intent: {e}")
-        return JSONResponse({"error": f"Internal server error: {str(e)}"}, status_code=500)
+    intent = intent_data.get("intent", "unknown")
+    reason = intent_data.get("reason", "")
 
-# =========================================================
-# STT for browser uploads (handles codecs=…)
-# =========================================================
+    if await request.is_disconnected():
+        return JSONResponse({"error": "Request aborted"}, status_code=499)
+
+    # 2) route
+    if intent == "weather":
+        result = "The forecast is Sunny, 25°C."
+    elif intent == "smalltalk":
+        sys = _system_prompt("SESSION-001")
+        convo = [{"role": "system", "content": sys}] + conversation_history
+        convo.append({"role": "user", "content": user_text})
+        chat = await oa.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=convo,
+            temperature=0.7,
+        )
+        result = (chat.choices[0].message.content or "").strip()
+        conversation_history += [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": result},
+        ]
+        conversation_history[:] = conversation_history[-40:]
+    elif intent == "web_search":
+        result = "Here's what I found on the web (stub)."
+    else:
+        result = "Hmm, I'm not sure what you mean."
+
+    # (Optional) fire-and-forget local TTS playback on the server machine.
+    # Commented out by default to avoid audio device issues.
+    # asyncio.create_task(_speak_locally(result))
+
+    return {"intent": intent, "reason": reason, "result": result}
+
+
+# ─────────────  Upload STT  ─────────────
 @api.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
     raw_ct = (file.content_type or "application/octet-stream").lower()
     base_ct = raw_ct.split(";")[0].strip()
-
     allowed = {
         "audio/webm", "audio/ogg", "audio/mpeg",
         "audio/wav", "audio/mp4", "audio/x-m4a",
@@ -211,6 +229,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
         return JSONResponse({"error": "File too large (25MB)."}, status_code=413)
 
     name = (file.filename or "").strip() or "input"
+    # try to leave extension sensible
     ext_map = {
         "audio/webm": ".webm", "audio/ogg": ".ogg", "audio/mpeg": ".mp3",
         "audio/wav": ".wav", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
@@ -221,64 +240,46 @@ async def transcribe_audio(file: UploadFile = File(...)):
     mimetype = base_ct if base_ct in ext_map else "application/octet-stream"
 
     try:
-        resp = await client.audio.transcriptions.create(
+        resp = await oa.audio.transcriptions.create(
             file=(name, io.BytesIO(audio_bytes), mimetype),
             model="gpt-4o-transcribe",
         )
-        return {"text": resp.text}
+        # newer SDKs: resp.text; older may be resp["text"]
+        text = getattr(resp, "text", None) or resp.get("text")
+        return {"text": text}
     except Exception as e:
         return JSONResponse({"error": f"Transcription failed: {e}"}, status_code=500)
 
-# =========================================================
-# Browser-playback TTS (MP3), with instant stop support
-# =========================================================
+
+# ─────────────  Browser TTS (MP3)  ─────────────
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "alloy"
+
 @api.post("/tts")
 async def tts_mp3(req: TTSRequest):
-    """
-    Returns MP3 bytes the browser <audio> can play.
-    Uses a tolerant param shim for SDK variants.
-    """
-    text = (req.text or "").strip()
-    voice = (req.voice or "alloy").strip() or "alloy"
-    if not text:
+    txt = (req.text or "").strip()
+    if not txt:
         return JSONResponse({"error": "Empty text"}, status_code=400)
-
-    async def create_tts(model: str, voice: str, text: str) -> Optional[bytes]:
-        attempts = (
-            {"format": "mp3"},
-            {"response_format": "mp3"},
-            {"audio_format": "mp3"},
-            {},
-        )
-        last = None
-        for extra in attempts:
-            try:
-                res = await client.audio.speech.create(
-                    model=model, voice=voice, input=text, **extra
-                )
-                data = None
-                if hasattr(res, "content") and isinstance(res.content, (bytes, bytearray)):
-                    data = bytes(res.content)
-                elif hasattr(res, "read"):
-                    data = await res.read()
-                elif isinstance(res, (bytes, bytearray)):
-                    data = bytes(res)
-                if data:
-                    return data
-            except TypeError as e:
-                last = e
-                continue
-            except Exception as e:
-                last = e
-                break
-        if last:
-            raise last
-        return None
-
+    voice = (req.voice or "alloy").strip() or "alloy"
     try:
-        data = await create_tts("gpt-4o-mini-tts", voice, text)
+        # Most recent SDKs:
+        audio = await oa.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice=voice,
+            input=txt,
+            response_format="mp3",  # some SDKs accept "format"
+        )
+        # Normalize to bytes
+        data = None
+        if hasattr(audio, "content") and isinstance(audio.content, (bytes, bytearray)):
+            data = bytes(audio.content)
+        elif hasattr(audio, "read"):
+            data = await audio.read()
+        elif isinstance(audio, (bytes, bytearray)):
+            data = bytes(audio)
         if not data:
-            raise RuntimeError("TTS returned no audio")
+            raise RuntimeError("No audio returned")
         return Response(
             content=data,
             media_type="audio/mpeg",
@@ -289,33 +290,35 @@ async def tts_mp3(req: TTSRequest):
             },
         )
     except Exception as e:
-        print(f"[/api/tts] error: {type(e).__name__}: {e}")
         return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
 
 @api.post("/tts/stop")
-async def stop_tts():
+async def tts_stop():
+    # no-op placeholder; you can wire this to an interruptible player if needed
+    return {"ok": True}
+
+
+# Mount API router
+app.include_router(api)
+
+
+# Root
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Assistant is running!"}
+
+
+# ─────────────────────────────────────────────────────────
+# Optional: server-side mic → Realtime VAD (desktop dev only)
+# Disabled by default; set ENABLE_VOICE=1 to try it.
+# ─────────────────────────────────────────────────────────
+ENABLE_VOICE = os.getenv("ENABLE_VOICE", "0") == "1"
+
+async def _server_vad_loop():
     try:
-        tts_player.stop()
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"error": f"stop failed: {e}"}, status_code=500)
-
-# =========================================================
-# Optional: server-side VAD loop (desktop/dev only)
-# =========================================================
-RATE = 16000
-CHUNK = 1024
-CHANNELS = 1
-
-async def mic_stream_vad():
-    if not OPENAI_API_KEY:
-        print("⚠️  OPENAI_API_KEY not set; skipping server VAD loop.")
-        return
-
-    try:
-        import pyaudio  # only import when enabled
+        import pyaudio  # only if you really want server mic
     except Exception:
-        print("⚠️  pyaudio not available; skipping server VAD loop.")
+        print("⚠️  pyaudio not installed; skipping server mic loop.")
         return
 
     uri = "wss://api.openai.com/v1/realtime?intent=transcription"
@@ -323,34 +326,31 @@ async def mic_stream_vad():
         ("Authorization", f"Bearer {OPENAI_API_KEY}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
+    RATE = 16000
+    CHUNK = 1024
 
     async with websockets.connect(uri, extra_headers=headers) as ws:
-        print("🎙️ Connected to OpenAI Realtime (transcription)")
-
+        # minimal session config
         await ws.send(json.dumps({
             "type": "transcription_session.update",
-            "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "gpt-4o-mini-transcribe",
-                    "language": "en",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                },
-                "input_audio_noise_reduction": {"type": "near_field"},
+            "input_audio_format": "pcm16",
+            "input_audio_transcription": {
+                "model": "gpt-4o-mini-transcribe",
+                "language": "en"
             },
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500
+            }
         }))
-        print("✅ VAD session ready")
 
         import pyaudio
         pa = pyaudio.PyAudio()
         stream = pa.open(
             format=pyaudio.paInt16,
-            channels=CHANNELS,
+            channels=1,
             rate=RATE,
             input=True,
             frames_per_buffer=CHUNK,
@@ -359,61 +359,41 @@ async def mic_stream_vad():
         async def send_audio():
             while True:
                 data = stream.read(CHUNK, exception_on_overflow=False)
-                audio_b64 = base64.b64encode(data).decode("utf-8")
-                await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
+                await ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(data).decode("utf-8")
+                }))
                 await asyncio.sleep(0.01)
 
-        async def receive_loop():
+        async def recv_loop():
             partial: Dict[str, str] = {}
-            async for message in ws:
-                event = json.loads(message)
-                et = event.get("type")
-
-                if et == "input_audio_buffer.speech_started":
-                    # BARGe-IN: kill any local playback instantly
-                    tts_player.stop()
-
-                elif et == "conversation.item.input_audio_transcription.delta":
-                    delta = event.get("delta", "")
-                    item_id = event.get("item_id")
+            async for msg in ws:
+                ev = json.loads(msg)
+                et = ev.get("type")
+                if et == "conversation.item.input_audio_transcription.delta":
+                    item_id = ev.get("item_id")
+                    delta = ev.get("delta", "")
                     partial[item_id] = partial.get(item_id, "") + delta
-                    print("✍️", partial[item_id], end="\r")
-
+                    print("…", partial[item_id], end="\r")
                 elif et == "conversation.item.input_audio_transcription.completed":
-                    item_id = event.get("item_id")
-                    text = event.get("transcript", "")
-                    print(f"\n✅ You said: {text}")
-
-                    # Route through the same endpoint logic
-                    await determine_intent(ChatMessage(message=text))
+                    item_id = ev.get("item_id")
+                    text = ev.get("transcript", "")
+                    print(f"\nYou said: {text}")
                     partial.pop(item_id, None)
 
-        await asyncio.gather(send_audio(), receive_loop())
+        await asyncio.gather(send_audio(), recv_loop())
 
-# =========================================================
-# Root + startup
-# =========================================================
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Assistant is running!"}
 
 @app.on_event("startup")
-async def startup_event():
+async def on_start():
     if ENABLE_VOICE:
-        asyncio.create_task(mic_stream_vad())
+        asyncio.create_task(_server_vad_loop())
         print("✅ Server VAD loop started (ENABLE_VOICE=1)")
     else:
         print("ℹ️ Server VAD disabled (ENABLE_VOICE=0)")
 
-# Mount /api
-app.include_router(api)
-
-# Optionally mirror a few routes at root (handy for debugging/health)
-@app.get("/healthz")
-async def _health_alias():
-    return await healthz()
 
 # Dev entry
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.assistant.app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)
