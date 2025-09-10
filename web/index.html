@@ -3,17 +3,22 @@
 <head>
   <meta charset="utf-8" />
   <title>JARVIS Orb — VAD Reactive</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#05070e" />
   <link href="https://fonts.cdnfonts.com/css/thegoodmonolith" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js" defer></script>
 </head>
 <body>
+  <noscript>
+    This app needs JavaScript enabled for the reactive orb and transcript.
+  </noscript>
+
   <!-- Space bg -->
-  <div class="space-background"></div>
+  <div class="space-background" aria-hidden="true"></div>
 
   <!-- Preloader -->
-  <div class="loading-overlay" id="loading-overlay">
+  <div class="loading-overlay" id="loading-overlay" role="status" aria-live="polite">
     <div class="loading-container">
       <div class="preloader-canvas-container">
         <canvas id="preloader-canvas" class="preloader-canvas" width="180" height="180"></canvas>
@@ -31,32 +36,44 @@
   <div class="circular-visualizer" aria-hidden="true">
     <canvas id="circular-canvas"></canvas>
   </div>
+
   <div class="audio-wave" id="audio-wave" aria-hidden="true"></div>
-  <div class="waveform" aria-hidden="true" style="position:absolute;top:16px;right:16px;width:320px;height:64px;z-index:10;opacity:.6;pointer-events:none;">
-    <canvas id="waveform-canvas" class="waveform-canvas" style="width:100%;height:100%;display:block;"></canvas>
+
+  <div class="waveform" aria-hidden="true">
+    <canvas id="waveform-canvas" class="waveform-canvas"></canvas>
   </div>
+
   <div class="floating-particles" id="floating-particles" aria-hidden="true"></div>
 
   <!-- Minimal header -->
   <div class="interface-container" aria-hidden="true">
-    <div class="header">
+    <header class="header">
       <div class="header-item">NEXUS.ORB/VAD</div>
       <div class="header-item middle">REAL TIME FULL DUPLEX VOICE ASSISTANT</div>
-      <div class="header-item" id="timestamp">TIME: 00:00:00</div>
-    </div>
-    <div class="scanner-frame">
+      <time class="header-item" id="timestamp" aria-label="Current time" datetime="">
+        TIME: 00:00:00
+      </time>
+    </header>
+
+    <div class="scanner-frame" role="img" aria-label="Voice activity detector frame">
       <div class="corner-tl"></div><div class="corner-tr"></div>
       <div class="corner-bl"></div><div class="corner-br"></div>
       <div class="scanner-id">VOICE.ACTIVITY.DETECTOR</div>
       <div class="scanner-id-right">ORB.DISTORT.RESPOND</div>
-      <div class="scanner-line"></div>
+      <div class="scanner-line" aria-hidden="true"></div>
     </div>
   </div>
 
-  <aside class="transcript-panel" aria-live="polite" aria-label="Live transcript">
+  <!-- Transcript (responsive via your CSS: side panel on desktop, bottom sheet on mobile) -->
+  <aside id="transcript-panel" class="transcript-panel" aria-live="polite" aria-label="Live transcript">
     <div class="transcript-title"> 🔴 LIVE TRANSCRIPT</div>
     <div id="transcript-stream" class="transcript-stream"></div>
   </aside>
+
+  <!-- Toggle for transcript panel (hook in your CSS/JS as desired) -->
+  <button class="transcript-toggle" id="transcript-toggle" aria-expanded="false" aria-controls="transcript-panel">
+    Transcript
+  </button>
 
   <!-- App -->
   <script type="module" src="script.js"></script>
