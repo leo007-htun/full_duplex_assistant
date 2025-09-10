@@ -59,7 +59,21 @@ document.addEventListener("DOMContentLoaded", () => {
   updateClock(); setInterval(updateClock, 1000);
 
   /* ===========================
-     AUDIO + LOCAL VAD
+     NOTIFY BANNER
+  ============================ */
+  const note = document.getElementById("notification");
+  let noteTimer=null;
+  function notify(msg, type="warn", timeout=3000){
+    if (!note) return;
+    note.textContent = msg;
+    note.dataset.type = type;
+    note.classList.add("show");
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(()=> note.classList.remove("show"), timeout);
+  }
+
+  /* ===========================
+     AUDIO + LOCAL VAD (visuals)
   ============================ */
   let audioContext = null, analyser = null;
   let audioData = null, freqData = null;
@@ -87,33 +101,10 @@ document.addEventListener("DOMContentLoaded", () => {
       analyser.smoothingTimeConstant = 0.85;
       audioData = new Float32Array(analyser.fftSize);
       freqData = new Uint8Array(analyser.frequencyBinCount);
-      notify("AUDIO ANALYZER READY • TAP THE ORB TO ENABLE MIC", "ok");
+      notify("AUDIO ANALYZER READY • TAP THE ORB TO ENABLE MIC", "ok", 2200);
     } catch (e) {
       console.error(e);
-      notify("AUDIO INIT ERROR", "error");
-    }
-  }
-
-  async function attachMic() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-      if (!audioContext) initAudio();
-      if (audioContext.state === "suspended") await audioContext.resume();
-      micSource = audioContext.createMediaStreamSource(stream);
-      micSource.connect(analyser); // visual path
-      micActive = true;
-      notify("MIC CONNECTED • VAD ACTIVE", "ok");
-      // also start realtime streaming (transcription)
-      startRealtime(stream);
-    } catch (err) {
-      console.error("Mic error:", err);
-      notify("MIC PERMISSION DENIED", "error");
+      notify("AUDIO INIT ERROR", "error", 4000);
     }
   }
 
@@ -302,6 +293,7 @@ document.addEventListener("DOMContentLoaded", () => {
     controls.enableDamping = true; controls.dampingFactor = 0.08;
     controls.enableZoom = false;
 
+    // Lights
     scene.add(new THREE.AmbientLight(0x88aabb, 1.2));
     const dl = new THREE.DirectionalLight(0xffffff, 1.2); dl.position.set(3,2,2); scene.add(dl);
     const p1 = new THREE.PointLight(0x66e6ff, 1.1, 10); p1.position.set(2,2,2); scene.add(p1);
@@ -483,7 +475,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const ox = orbGroup.rotation.x, oy = orbGroup.rotation.y;
     gsap.fromTo(orbGroup.rotation, { x: ox+0.15, y: oy-0.25 }, { x: ox, y: oy, duration: 0.35, ease: "power3.out" });
     gsap.fromTo(camera.position, { z: 9.2 }, { z: 10, duration: 0.45, ease: "power2.out" });
-    notify("VOICE DETECTED", "ok");
+    notify("VOICE DETECTED", "ok", 900);
   }
 
   /* ===========================
@@ -530,150 +522,59 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   /* ===========================
-     NOTIFY BANNER
-  ============================ */
-  const note = document.getElementById("notification");
-  let noteTimer=null;
-  function notify(msg, type="warn", timeout=3000){
-    if (!note) return;
-    note.textContent = msg;
-    note.dataset.type = type;
-    note.classList.add("show");
-    clearTimeout(noteTimer);
-    noteTimer = setTimeout(()=> note.classList.remove("show"), timeout);
-  }
-
-  /* ===========================
-     REAL-TIME TRANSCRIPTION (WS)
+     REAL-TIME TRANSCRIPTION (OpenAI Realtime)
   ============================ */
   const transcriptEl = document.getElementById("transcript-stream");
   let ws = null;
   let wsOpen = false;
-
-  // PCM16 encoder (Float32Array -> base64 PCM16LE)
-  function floatTo16BitPCM(float32Array) {
-    const buffer = new ArrayBuffer(float32Array.length * 2);
-    const view = new DataView(buffer);
-    let offset = 0;
-    for (let i = 0; i < float32Array.length; i++, offset += 2) {
-      let s = Math.max(-1, Math.min(1, float32Array[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-    return buffer;
-  }
-  function toBase64(arrayBuffer) {
-    let binary = "";
-    const bytes = new Uint8Array(arrayBuffer);
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-    }
-    return btoa(binary);
-  }
-
-  // Accumulator for ~100ms chunks
   let captureNode = null;
-  let pcmQueue = [];
-  let pcmSamplesNeeded = 0;
+  let appendedMsSinceCommit = 0;   // ms of audio appended since last commit
+  let everAppended = false;        // have we appended anything yet?
+  let lastCommitAt = 0;            // to throttle commits
 
-  async function startRealtime(userMediaStream) {
-    try {
-      // 1) get ephemeral token from our backend
-      const r = await fetch("/rt-token");
-      if (!r.ok) {
-        notify("TOKEN FETCH FAILED", "error", 4000);
-        return;
+  // Live-server (5500) → FastAPI (8000) token bridge; otherwise same-origin.
+  const TOKEN_URL = (location.hostname === "localhost" || location.hostname === "127.0.0.1")
+    ? "http://127.0.0.1:8000/rt-token"
+    : "/rt-token";
+
+  // helpers: downsample 48k→16k + PCM16 + base64
+  function downsampleTo16k(buffer, inRate) {
+    const outRate = 16000;
+    if (inRate === outRate) return buffer;
+    const ratio = inRate / outRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+    let idx = 0, pos = 0;
+    while (idx < newLen) {
+      const nextPos = Math.round((idx + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let i = Math.floor(pos); i < Math.min(buffer.length, nextPos); i++) {
+        sum += buffer[i]; count++;
       }
-      const { client_secret } = await r.json();
-      const token = client_secret?.value;
-      if (!token) {
-        notify("TOKEN MISSING IN RESPONSE", "error", 4000);
-        return;
-      }
-
-      // 2) open WebSocket with token via subprotocols (browser can't set headers)
-      const url = "wss://api.openai.com/v1/realtime?intent=transcription";
-      const protocols = [
-        "realtime",                        // base protocol
-        "openai-insecure-api-key." + token, // pass token
-        "openai-beta.realtime-v1"           // feature flag
-      ];
-      ws = new WebSocket(url, protocols);
-
-      ws.onopen = () => {
-        wsOpen = true;
-        notify("REALTIME: CONNECTED", "ok", 2000);
-
-        // 3) configure server VAD + transcription model
-        const cfg = {
-          type: "transcription_session.update",
-          input_audio_format: "pcm16",
-          input_audio_transcription: {
-            model: "gpt-4o-mini-transcribe",
-            prompt: "",
-            language: ""
-          },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 500
-          },
-          input_audio_noise_reduction: { type: "near_field" },
-          include: ["item.input_audio_transcription.logprobs"]
-        };
-        ws.send(JSON.stringify(cfg));
-
-        // 4) begin streaming PCM16 chunks from mic
-        startMicPCMStream(userMediaStream);
-      };
-
-      ws.onmessage = (ev) => {
-        let msg;
-        try { msg = JSON.parse(ev.data); } catch { return; }
-
-        // Common events:
-        // - input_audio_buffer.committed  (server VAD identified a turn)
-        // - transcript.text.delta         (partial)
-        // - transcript.text.done          (final)
-        // - error
-        if (msg.type === "error") {
-          console.warn("Realtime error:", msg);
-          notify(`REALTIME ERROR: ${msg.error?.message || "unknown"}`, "error", 5000);
-        }
-
-        if (msg.type === "input_audio_buffer.committed") {
-          // Optional: visually mark a new turn
-          // notify("TURN DETECTED", "ok", 1200);
-        }
-
-        if (msg.type === "transcript.text.delta" || msg.type === "transcript.delta") {
-          appendTranscript(msg.delta || msg.text_delta || "");
-        }
-        if (msg.type === "transcript.text.done" || msg.type === "transcript.done") {
-          finalizeTranscript(msg.text || msg.transcript || "");
-        }
-      };
-
-      ws.onclose = (ev) => {
-        wsOpen = false;
-        if (ev.code === 1008 || ev.code === 4401 || ev.code === 4403) {
-          notify("REAL TIME AUTH FAILED", "error", 5000);
-        } else {
-          notify(`REALTIME CLOSED (${ev.code})`, "warn", 3000);
-        }
-        stopMicPCMStream();
-      };
-      ws.onerror = () => {
-        notify("REALTIME SOCKET ERROR", "error", 4000);
-      };
-
-    } catch (e) {
-      console.error(e);
-      notify("REALTIME INIT FAILED", "error", 4000);
+      result[idx++] = count ? (sum / count) : 0;
+      pos = nextPos;
     }
+    return result;
+  }
+  function float32ToPCM16LE(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+  function abToBase64(ab) {
+    const bytes = new Uint8Array(ab);
+    let bin = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
   }
 
+  // transcript UI
   function appendTranscript(deltaText) {
     if (!deltaText) return;
     let frag = transcriptEl.querySelector(".frag");
@@ -685,54 +586,173 @@ document.addEventListener("DOMContentLoaded", () => {
     frag.textContent += deltaText;
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
-
   function finalizeTranscript(fullText) {
-    // Move frag to final line
     const frag = transcriptEl.querySelector(".frag");
     const line = document.createElement("div");
     line.className = "final";
-    line.textContent = fullText || (frag ? frag.textContent : "");
+    line.textContent = (fullText || (frag ? frag.textContent : "") || "").trim();
     if (frag) frag.remove();
-    transcriptEl.appendChild(line);
+    if (line.textContent) transcriptEl.appendChild(line);
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
+  async function startRealtime(userMediaStream) {
+    try {
+      // 1) fetch ephemeral token
+      const r = await fetch(TOKEN_URL, { cache: "no-store" });
+      if (!r.ok) { notify("AUTH HTTP ERROR", "error", 4000); return; }
+      const tok = await r.json();
+      const token =
+        tok?.client_secret?.value ||
+        tok?.client_secret ||
+        tok?.value;
+      if (!token) { notify("AUTH MISSING TOKEN", "error", 4000); return; }
+
+      // 2) connect WS
+      const url = "wss://api.openai.com/v1/realtime?intent=transcription";
+      ws = new WebSocket(url, [
+        "realtime",
+        `openai-insecure-api-key.${token}`,
+        "openai-beta.realtime-v1"
+      ]);
+
+      ws.onopen = () => {
+        wsOpen = true;
+        everAppended = false;
+        appendedMsSinceCommit = 0;
+        lastCommitAt = performance.now();
+        notify("REALTIME LINK ESTABLISHED", "ok", 1800);
+
+        // 3) configure session (server VAD + transcription model)
+        ws.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            input_audio_format: "pcm16",
+            input_audio_transcription: {
+              model: "gpt-4o-mini-transcribe" // or "gpt-4o-transcribe"
+              // language: "en" // optional: set if you know the language
+            },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500
+            },
+            input_audio_noise_reduction: { type: "near_field" }
+            // include: ["item.input_audio_transcription.logprobs"] // optional
+          }
+        }));
+
+        // 4) begin mic streaming
+        startMicPCMStream(userMediaStream);
+      };
+
+      ws.onmessage = (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        const t = msg.type;
+        if (t === "input_audio_buffer.committed") {
+          // server created a speech chunk; reset our counter
+          appendedMsSinceCommit = 0;
+        }
+
+        // Newer events
+        if (t === "conversation.item.input_audio_transcription.delta") {
+          appendTranscript(msg.delta || "");
+          return;
+        }
+        if (t === "conversation.item.input_audio_transcription.completed") {
+          finalizeTranscript(msg.transcript || "");
+          return;
+        }
+
+        // Back-compat events
+        if (t === "transcript.text.delta" || t === "response.output_text.delta" || t === "response.transcript.delta") {
+          appendTranscript(msg.delta || msg.text || msg.value || "");
+          return;
+        }
+        if (t === "transcript.text.done" || t === "response.output_text.done" || t === "response.transcript.done") {
+          finalizeTranscript(msg.text || msg.value || "");
+          return;
+        }
+
+        if (t === "transcription.speech_stopped") {
+          maybeCommitToServer(true);
+        }
+
+        if (t === "error") {
+          notify(`REALTIME ERROR: ${msg.error?.message || "unknown"}`, "error", 5000);
+        }
+      };
+
+      ws.onclose = (ev) => {
+        wsOpen = false;
+        everAppended = false;
+        appendedMsSinceCommit = 0;
+        stopMicPCMStream();
+        if ([1008, 4401, 4403].includes(ev.code)) {
+          notify("REAL TIME AUTH FAILED", "error", 5000);
+        } else {
+          notify(`REALTIME CLOSED (${ev.code})`, "warn", 2500);
+        }
+      };
+
+      ws.onerror = () => notify("REALTIME SOCKET ERROR", "error", 4000);
+
+    } catch (e) {
+      console.error(e);
+      notify("REALTIME INIT FAILED", "error", 4000);
+    }
+  }
+
+  // mic capture → 16k PCM16 → WS append
   function startMicPCMStream(userMediaStream) {
-    // Build capture path with ScriptProcessor (works widely; AudioWorklet is nicer but more setup)
+    if (!audioContext) return;
     const inputNode = audioContext.createMediaStreamSource(userMediaStream);
+
+
+    // ScriptProcessor for broad compatibility
     captureNode = audioContext.createScriptProcessor(4096, 1, 1);
-
-    // We need node connected to *something* or it may not fire in some browsers
-    const zeroGain = audioContext.createGain(); zeroGain.gain.value = 0;
-    captureNode.connect(zeroGain); zeroGain.connect(audioContext.destination);
-
+    const sink = audioContext.createGain(); sink.gain.value = 0;
+    captureNode.connect(sink); sink.connect(audioContext.destination);
     inputNode.connect(captureNode);
 
-    const sampleRate = audioContext.sampleRate; // usually 48000
-    pcmSamplesNeeded = Math.floor(sampleRate * 0.1); // ~100ms chunks
+    const inRate = audioContext.sampleRate;            // ~48000
+    //const frameMs = 100;                               // ~100ms frames
+    //const samplesPerFrame = Math.floor(inRate * 0.1);
+    const frameMs = 220;  // send ~120ms frames so each append is safely >100ms
+    const samplesPerFrame = Math.floor(inRate * (frameMs / 1000));
 
     let acc = new Float32Array(0);
 
     captureNode.onaudioprocess = (e) => {
-      if (!wsOpen) return;
+      if (!wsOpen || !ws || ws.readyState !== 1) return;
+
+      // read directly from the mic callback
       const input = e.inputBuffer.getChannelData(0);
-      // concat into acc
+
+      // concat into accumulator
       const tmp = new Float32Array(acc.length + input.length);
       tmp.set(acc, 0); tmp.set(input, acc.length);
       acc = tmp;
 
-      while (acc.length >= pcmSamplesNeeded) {
-        const chunk = acc.subarray(0, pcmSamplesNeeded);
-        const rest = acc.subarray(pcmSamplesNeeded);
-        const pcm16 = floatTo16BitPCM(chunk);
-        const b64 = toBase64(pcm16);
-        ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-        acc = new Float32Array(rest.length);
-        acc.set(rest, 0);
+      while (acc.length >= samplesPerFrame) {
+        const chunk = acc.subarray(0, samplesPerFrame);
+        const rest  = acc.subarray(samplesPerFrame);
+        acc = new Float32Array(rest.length); acc.set(rest, 0);
+
+        const ds    = downsampleTo16k(chunk, inRate);   // -> 16k
+        const pcm16 = float32ToPCM16LE(ds);
+        const b64   = abToBase64(pcm16.buffer);
+
+        try {
+          ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+          everAppended = true;
+          appendedMsSinceCommit += (ds.length / 16000) * 1000; // samples → ms
+        } catch {}
       }
     };
-  }
 
+  }
   function stopMicPCMStream() {
     if (captureNode) {
       try { captureNode.disconnect(); } catch {}
@@ -740,10 +760,32 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  // Optional: speed up finals using local VAD → commit after silence
+function maybeCommitToServer(force = false) {
+  if (!wsOpen || !ws || ws.readyState !== 1) return;
+  if (!everAppended) return; // don't commit before any audio was sent
+
+  const now = performance.now();
+
+  // Only commit if we’ve sent ≥120ms since last commit and not too spammy
+  if (!force) {
+    if (appendedMsSinceCommit < 120) return;
+    if (now - lastCommitAt < 300) return; // throttle a bit
+  }
+
+  try {
+    ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    lastCommitAt = now;
+    appendedMsSinceCommit = 0;
+  } catch {}
+}
+
+
   /* ===========================
      ANIMATE LOOP
   ============================ */
   let lastVADEmit = 0;
+  let silenceFrames = 0;
   function animate(){
     requestAnimationFrame(animate);
     controls && controls.update();
@@ -763,6 +805,16 @@ document.addEventListener("DOMContentLoaded", () => {
         if (now - lastVADEmit > 120) {
           disturbOrb();
           lastVADEmit = now;
+        }
+        silenceFrames = 0;
+      } else if (vadState.speaking) {
+        silenceFrames = 0;
+      } else {
+        // when locally silent for ~500ms, ask server to finalize
+        silenceFrames++;
+        if (silenceFrames > 30) { // ~30 frames at ~60fps ≈ 500ms
+          maybeCommitToServer();
+          silenceFrames = 0;
         }
       }
     }
@@ -784,12 +836,37 @@ document.addEventListener("DOMContentLoaded", () => {
   initDOMParticles();
   notify("SYSTEM ONLINE • TAP THE ORB TO ENABLE MIC", "ok", 2800);
 
-  // Activate mic when user clicks the orb area / anywhere
-  window.addEventListener("click", async () => {
-    try{
-      if (!audioContext) initAudio();
+  // One-time mic+realtime enable on user gesture
+  async function enableMicAndRealtime() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1
+        }
+      });
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
       if (audioContext.state === "suspended") await audioContext.resume();
-      if (!micActive) await attachMic();
-    }catch(e){/* noop */}
-  }, { once:false });
+
+      micSource = audioContext.createMediaStreamSource(stream);
+      if (analyser) micSource.connect(analyser);
+      micActive = true;
+
+      // kick off realtime
+      startRealtime(stream);
+
+      notify("MIC CONNECTED • REALTIME ON", "ok", 1600);
+    } catch (err) {
+      console.error("getUserMedia error:", err);
+      notify("MIC PERMISSION DENIED", "error", 4000);
+    }
+  }
+
+  // Start on first click anywhere (or bind to orb if you prefer)
+  window.addEventListener("click", () => { enableMicAndRealtime(); }, { once: true });
+
 });
