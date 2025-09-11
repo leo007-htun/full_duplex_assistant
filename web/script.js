@@ -741,27 +741,36 @@ document.addEventListener("DOMContentLoaded", () => {
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
       // Use actual device rate to avoid resampling
-      const OUTPUT_RATE = pcmPlayer?.sampleRate || 16000;
-      pcmPlayer?.setServerRate(OUTPUT_RATE);
-
+      const deviceRate = pcmPlayer?.sampleRate || (new (window.AudioContext || window.webkitAudioContext)()).sampleRate;
+      // Normalize to a rate the API supports (prefer 48000, else 44100, else 24000)
+      const preferredRates = [48000, 44100, 24000];
+      const desiredOutRate = preferredRates.find(r => Math.abs(r - deviceRate) < 2000) || 48000;
+      
+      console.log("[AUDIO] deviceRate=", deviceRate, "desiredOutRate=", desiredOutRate);
+      pcmPlayer?.setServerRate(desiredOutRate);
+      
       ws.send(JSON.stringify({
         type: "session.update",
         session: {
+          // mic in
           input_audio_format: "pcm16",
           input_audio_sample_rate_hz: 16000,
           input_audio_channels: 1,
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           input_audio_noise_reduction: { type: "near_field" },
-
+      
+          // TTS out -> **force the server to match device**
           output_audio_format: "pcm16",
-          output_audio_sample_rate_hz: OUTPUT_RATE,
-          voice: "alloy",     // warmer than "verse"
-          speed: 0.95,        // less “chipmunk”
-
+          output_audio_sample_rate_hz: desiredOutRate,
+      
+          // voice timbre affects “tinny” perception too
+          voice: "alloy", // try "alloy" (warmer) or "verse"
+      
           turn_detection: { type: "server_vad", threshold: 0.1, prefix_padding_ms: 300, silence_duration_ms: 1000 },
           instructions: "You are Jarvis. Be concise, helpful, and speak in short, friendly, energetic sentences."
         }
       }));
+
 
       startMicPCMStream(userMediaStream);
 
