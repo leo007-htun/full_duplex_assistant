@@ -239,11 +239,25 @@ document.addEventListener("DOMContentLoaded", () => {
     audioWave.style.borderColor = `rgba(102,230,255,${0.10 + avg * 0.35})`;
   }
 
-  /* ------------ THREE ORB ------------ */
+  /* ------------ THREE ORB (with distortion) ------------ */
   let scene, camera, renderer, controls;
   let orbGroup, updateOrbUniforms, updateBackground;
   let clock = new THREE.Clock();
   let rotationSpeed = 1.0, distortionAmount = 1.0, resolution = 32;
+
+  // audio → lowband energy for distortion drive
+  function getLowbandLevel() {
+    if (!analyser || !freqData) return 0;
+    analyser.getByteFrequencyData(freqData);
+    const take = Math.max(8, Math.floor(freqData.length * 0.08)); // lowest ~8% bins
+    let s = 0;
+    for (let i = 0; i < take; i++) s += freqData[i];
+    return (s / (take * 255));
+  }
+
+  // short glitch kick envelope
+  let kick = 0.0;
+  function triggerKick() { kick = 1.0; }
 
   function initThree() {
     scene = new THREE.Scene();
@@ -330,51 +344,127 @@ document.addEventListener("DOMContentLoaded", () => {
     const geo = new THREE.IcosahedronGeometry(radius, Math.max(1, Math.floor(resolution / 8)));
     const mat = new THREE.ShaderMaterial({
       uniforms: {
-        time: { value: 0 }, color: { value: new THREE.Color(0x66e6ff) },
-        audioLevel: { value: 0 }, distortion: { value: distortionAmount }
+        time: { value: 0 },
+        color: { value: new THREE.Color(0x66e6ff) },
+        audioLevel: { value: 0 },
+        distortion: { value: distortionAmount },
+        kick: { value: 0.0 }
       },
-      vertexShader: `/* noise + displacement (trimmed for brevity; keep your original) */ 
-        uniform float time, audioLevel, distortion;
+      vertexShader: `
+        // 3D simplex noise (iq)
+        vec3 mod289(vec3 x){return x - floor(x * (1.0/289.0)) * 289.0;}
+        vec4 mod289(vec4 x){return x - floor(x * (1.0/289.0)) * 289.0;}
+        vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+        vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+        float snoise(vec3 v){
+          const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+          const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+          vec3 i  = floor(v + dot(v, C.yyy) );
+          vec3 x0 = v - i + dot(i, C.xxx) ;
+          vec3 g = step(x0.yzx, x0.xyz);
+          vec3 l = 1.0 - g;
+          vec3 i1 = min( g.xyz, l.zxy );
+          vec3 i2 = max( g.xyz, l.zxy );
+          vec3 x1 = x0 - i1 + C.xxx;
+          vec3 x2 = x0 - i2 + C.yyy;
+          vec3 x3 = x0 - D.yyy;
+          i = mod289(i);
+          vec4 p = permute( permute( permute(
+                    i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                  + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                  + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+          float n_ = 0.142857142857;
+          vec3  ns = n_ * D.wyz - D.xzx;
+          vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+          vec4 x_ = floor(j * ns.z);
+          vec4 y_ = floor(j - 7.0 * x_);
+          vec4 x = x_ * ns.x + ns.yyyy;
+          vec4 y = y_ * ns.x + ns.yyyy;
+          vec4 h = 1.0 - abs(x) - abs(y);
+          vec4 b0 = vec4( x.xy, y.xy );
+          vec4 b1 = vec4( x.zw, y.zw );
+          vec4 s0 = floor(b0)*2.0 + 1.0;
+          vec4 s1 = floor(b1)*2.0 + 1.0;
+          vec4 sh = -step(h, vec4(0.0));
+          vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+          vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+          vec3 p0 = vec3(a0.xy,h.x);
+          vec3 p1 = vec3(a1.zw,h.y);
+          vec3 p2 = vec3(a1.xy,h.z);
+          vec3 p3 = vec3(a1.zw,h.w);
+          vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+          p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+          vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+          m = m * m;
+          return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
+                                        dot(p2,x2), dot(p3,x3) ) );
+        }
+
+        uniform float time, audioLevel, distortion, kick;
         varying vec3 vN; varying vec3 vP;
-        /* ... snoise helpers from your version ... */
-        float snoise(vec3 v){ /* unchanged */ return 0.0; } 
+
         void main(){
           vN = normalize(normalMatrix * normal);
-          float slow = time*0.3;
+          float t = time * 0.35;
+
+          // base sphere pos
           vec3 p = position;
-          float n = snoise(vec3(position*0.55 + slow));
-          p += normal * n * 0.22 * distortion * (1.0 + audioLevel);
+
+          // multi-band noise (warmer near “poles”)
+          float n1 = snoise(p*0.55 + vec3(t, 0.0, 0.0));
+          float n2 = snoise(p*1.1  + vec3(0.0, t*0.6, 0.0));
+          float n = n1*0.7 + n2*0.3;
+
+          // audio-reactive amplitude + short glitch kick
+          float audioAmt = audioLevel * 0.85;
+          float kickAmt  = kick * 0.85; // fades every frame in JS
+          float wobble = (0.22 * distortion) * (1.0 + audioAmt*1.6 + kickAmt);
+
+          // add a little ridged turbulence
+          float ridge = abs(snoise(p*2.2 + t*0.8));
+          float disp  = n * wobble + ridge * 0.06 * (1.0 + audioAmt);
+
+          p += normalize(normal) * disp;
+
           vP = p;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(p,1.0);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
         }`,
       fragmentShader: `
-        uniform float time; uniform vec3 color; uniform float audioLevel;
+        uniform float time; uniform vec3 color; uniform float audioLevel; uniform float kick;
         varying vec3 vN; varying vec3 vP;
         void main(){
-          vec3 viewDir = normalize(cameraPosition - vP);
-          float fres = 1.0 - max(0.0, dot(viewDir, normalize(vN)));
-          fres = pow(fres, 2.2 + audioLevel*2.5);
-          float pulse = 0.7 + 0.3*sin(time*2.0);
-          vec3 col = color * fres * pulse * (1.0 + audioLevel*0.8);
-          float a = fres * (0.75 - audioLevel*0.3);
+          vec3 N = normalize(vN);
+          vec3 V = normalize(cameraPosition - vP);
+
+          float fres = 1.0 - max(0.0, dot(V, N));
+          fres = pow(fres, 2.2 + audioLevel*2.5 + kick*1.2);
+
+          float pulse = 0.7 + 0.3*sin(time*2.0 + kick*4.0);
+          vec3  col   = color * fres * pulse * (1.0 + audioLevel*0.8 + kick*0.4);
+          float a     = fres * (0.75 - audioLevel*0.3);
+
           gl_FragColor = vec4(col, a);
         }`,
-      wireframe: true, transparent: true
+      wireframe: true,
+      transparent: true
     });
     const mesh = new THREE.Mesh(geo, mat);
     orbGroup.add(mesh);
 
     const glowGeo = new THREE.SphereGeometry(radius * 1.18, 32, 32);
     const glowMat = new THREE.ShaderMaterial({
-      uniforms: { time: { value: 0 }, color: { value: new THREE.Color(0x66e6ff) }, audioLevel: { value: 0} },
-      vertexShader: `varying vec3 vN; varying vec3 vP; uniform float audioLevel;
-        void main(){ vN=normalize(normalMatrix*normal); vP=position*(1.0+audioLevel*0.22);
+      uniforms: { time: { value: 0 }, color: { value: new THREE.Color(0x66e6ff) }, audioLevel: { value: 0}, kick: { value: 0 } },
+      vertexShader: `varying vec3 vN; varying vec3 vP; uniform float audioLevel; uniform float kick;
+        void main(){ vN=normalize(normalMatrix*normal);
+          float s = 1.0 + audioLevel*0.22 + kick*0.15;
+          vP = position * s;
           gl_Position=projectionMatrix*modelViewMatrix*vec4(vP,1.0); }`,
-      fragmentShader: `varying vec3 vN; varying vec3 vP; uniform vec3 color; uniform float time; uniform float audioLevel;
+      fragmentShader: `varying vec3 vN; varying vec3 vP; uniform vec3 color; uniform float time; uniform float audioLevel; uniform float kick;
         void main(){ vec3 viewDir=normalize(cameraPosition - vP);
-          float fres=1.0-max(0.0,dot(viewDir,normalize(vN))); fres=pow(fres, 3.0 + audioLevel*3.0);
-          float pulse=0.55 + 0.45*sin(time*2.0);
-          float af = 1.0 + audioLevel*3.0;
+          float fres=1.0-max(0.0,dot(viewDir,normalize(vN)));
+          fres=pow(fres, 3.0 + audioLevel*3.0 + kick*1.0);
+          float pulse=0.55 + 0.45*sin(time*2.0 + kick*5.0);
+          float af = 1.0 + audioLevel*3.0 + kick*0.8;
           vec3 col = color * fres * (0.8 + 0.2*pulse) * af;
           float a = fres * (0.28 * af) * (1.0 - audioLevel*0.2);
           gl_FragColor = vec4(col, a);
@@ -384,12 +474,15 @@ document.addEventListener("DOMContentLoaded", () => {
     orbGroup.add(new THREE.Mesh(glowGeo, glowMat));
     scene.add(orbGroup);
 
-    return (time, level) => {
+    return (time, level, kickVal) => {
       mat.uniforms.time.value = time;
       mat.uniforms.audioLevel.value = level;
       mat.uniforms.distortion.value = distortionAmount;
+      mat.uniforms.kick.value = kickVal;
+
       glowMat.uniforms.time.value = time;
       glowMat.uniforms.audioLevel.value = level;
+      glowMat.uniforms.kick.value = kickVal;
     };
   }
 
@@ -437,8 +530,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.protocol === "file:";
   const TOKEN_ENDPOINT = IS_LOCAL ? "http://127.0.0.1:8000/rt-token" : "/api/rt-token";
 
-
-
   const transcriptEl = document.getElementById("transcript-stream");
   let ws = null, wsOpen = false;
 
@@ -476,23 +567,30 @@ document.addEventListener("DOMContentLoaded", () => {
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
+  // ====== PCM Player with mastering ======
   class PCMPlayer {
     constructor() {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      this.sampleRate = this.ctx.sampleRate;
+      this.sampleRate = this.ctx.sampleRate;  // usually 48000
       this.serverRate = this.sampleRate;
       this.node = null;
       this.started = false;
       this.activeGen = 0;
+      // mastering nodes
+      this.gain = null; this.lowShelf = null; this.presenceCut = null; this.highShelf = null; this.comp = null;
     }
     async init() {
       if (this.node) return;
       const workletCode = `
         class PCMFeeder extends AudioWorkletProcessor {
-          constructor(){ super(); this.buffers=[]; this.readIndex=0; this.cur=null;
+          constructor(){
+            super();
+            this.buffers = [];
+            this.readIndex = 0;
+            this.cur = null;
             this.port.onmessage = e => {
               const d = e.data || {};
-              if (d.type === 'push') this.buffers.push(new Float32Array(d.payload));
+              if (d.type === 'push')      this.buffers.push(new Float32Array(d.payload));
               else if (d.type === 'clear'){ this.buffers.length=0; this.cur=null; this.readIndex=0; }
             };
           }
@@ -515,9 +613,44 @@ document.addEventListener("DOMContentLoaded", () => {
       const url = URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" }));
       await this.ctx.audioWorklet.addModule(url);
       this.node = new AudioWorkletNode(this.ctx, 'pcm-feeder');
-      this.node.connect(this.ctx.destination);
+
+      // Mastering chain
+      this.gain = this.ctx.createGain();
+      this.gain.gain.value = 1.35; // 1.0–1.6
+
+      this.lowShelf = this.ctx.createBiquadFilter();
+      this.lowShelf.type = "lowshelf";
+      this.lowShelf.frequency.value = 250;
+      this.lowShelf.gain.value = 3;
+
+      this.presenceCut = this.ctx.createBiquadFilter();
+      this.presenceCut.type = "peaking";
+      this.presenceCut.frequency.value = 3500;
+      this.presenceCut.Q.value = 0.9;
+      this.presenceCut.gain.value = -2;
+
+      this.highShelf = this.ctx.createBiquadFilter();
+      this.highShelf.type = "highshelf";
+      this.highShelf.frequency.value = 8000;
+      this.highShelf.gain.value = -1.5;
+
+      this.comp = this.ctx.createDynamicsCompressor();
+      this.comp.threshold.value = -24;
+      this.comp.knee.value = 20;
+      this.comp.ratio.value = 3;
+      this.comp.attack.value = 0.005;
+      this.comp.release.value = 0.08;
+
+      // Connect: feeder → gain → lowshelf → presenceCut → highshelf → comp → out
+      this.node.connect(this.gain);
+      this.gain.connect(this.lowShelf);
+      this.lowShelf.connect(this.presenceCut);
+      this.presenceCut.connect(this.highShelf);
+      this.highShelf.connect(this.comp);
+      this.comp.connect(this.ctx.destination);
     }
     async start() { await this.init(); if (this.ctx.state === "suspended") await this.ctx.resume(); this.started = true; }
+    setVolume(mult) { if (this.gain) this.gain.gain.value = Math.max(0, Math.min(mult, 3)); }
     clear() { this.node?.port.postMessage({ type: 'clear' }); }
     setGeneration(gen) { this.activeGen = gen; }
     setServerRate(hz) { this.serverRate = hz || this.sampleRate; }
@@ -540,7 +673,9 @@ document.addEventListener("DOMContentLoaded", () => {
       const i16 = new Int16Array(view.buffer);
       let f32 = new Float32Array(i16.length);
       for (let i = 0; i < i16.length; i++) f32[i] = Math.max(-1, Math.min(1, i16[i] / 32768));
-      if (this.serverRate !== this.sampleRate) f32 = PCMPlayer.resampleLinear(f32, this.serverRate, this.sampleRate);
+      if (this.serverRate !== this.sampleRate) {
+        f32 = PCMPlayer.resampleLinear(f32, this.serverRate, this.sampleRate);
+      }
       this.node.port.postMessage({ type: 'push', payload: f32.buffer }, [f32.buffer]);
     }
   }
@@ -605,9 +740,9 @@ document.addEventListener("DOMContentLoaded", () => {
       ws = sock; wsOpen = true; everAppended = false; appendedMsSinceCommit = 0; lastCommitAt = performance.now();
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
-      // Choose server output rate: prefer device rate if available
-      const desiredOutRate = pcmPlayer?.sampleRate ?? 24000;   // <-- fixed bug
-      pcmPlayer?.setServerRate(desiredOutRate);
+      // Use actual device rate to avoid resampling
+      const OUTPUT_RATE = pcmPlayer?.sampleRate || 48000;
+      pcmPlayer?.setServerRate(OUTPUT_RATE);
 
       ws.send(JSON.stringify({
         type: "session.update",
@@ -617,9 +752,12 @@ document.addEventListener("DOMContentLoaded", () => {
           input_audio_channels: 1,
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           input_audio_noise_reduction: { type: "near_field" },
+
           output_audio_format: "pcm16",
-          output_audio_sample_rate_hz: desiredOutRate,
-          voice: "verse",
+          output_audio_sample_rate_hz: OUTPUT_RATE,
+          voice: "alloy",     // warmer than "verse"
+          speed: 0.95,        // less “chipmunk”
+
           turn_detection: { type: "server_vad", threshold: 0.1, prefix_padding_ms: 300, silence_duration_ms: 1000 },
           instructions: "You are Jarvis. Be concise, helpful, and speak in short, friendly, energetic sentences."
         }
@@ -635,14 +773,29 @@ document.addEventListener("DOMContentLoaded", () => {
         if (t === "conversation.item.input_audio_transcription.completed") { finalizeTranscript(msg.transcript || ""); return; }
 
         if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
-          ws.send(JSON.stringify({ type: "response.create", response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: desiredOutRate, voice: "verse" } } }));
+          ws.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: OUTPUT_RATE, voice: "alloy" } }
+          }));
           return;
         }
         if (t === "response.created") { bumpGeneration(); pcmPlayer?.clear(); return; }
-        if (t === "response.output_audio.start" || t === "response.audio.start") { if (msg?.sample_rate_hz) pcmPlayer?.setServerRate(msg.sample_rate_hz); return; }
+
+        if (t === "response.output_audio.start" || t === "response.audio.start") {
+          if (msg?.sample_rate_hz) pcmPlayer?.setServerRate(msg.sample_rate_hz);
+          else pcmPlayer?.setServerRate(OUTPUT_RATE);
+          return;
+        }
+
         if (t === "response.output_text.delta" || t === "response.transcript.delta") { appendAssistantText(msg.delta || msg.text || msg.value || ""); return; }
         if (t === "response.completed" || t === "response.output_text.done") { endAssistantCaption(); return; }
-        if (t === "response.output_audio.delta" || t === "response.audio.delta") { const b64 = msg.delta || msg.audio; if (b64) pcmPlayer?.enqueueBase64PCM16(b64, activeGen); return; }
+
+        if (t === "response.output_audio.delta" || t === "response.audio.delta") {
+          const b64 = msg.delta || msg.audio;
+          if (b64) pcmPlayer?.enqueueBase64PCM16(b64, activeGen);
+          return;
+        }
+
         if (t === "input_audio_buffer.speech_started") { hardStopAssistantAudio(); return; }
 
         if (t === "error") { console.error("Realtime error:", msg); notify(`REALTIME ERROR: ${msg.error?.message || "unknown"}`, "error", 5000); }
@@ -714,6 +867,7 @@ document.addEventListener("DOMContentLoaded", () => {
     controls?.update();
     const t = clock.getElapsedTime();
 
+    // distortion drive: lowband + speech kick envelope
     let level = 0;
     if (analyser && freqData) {
       analyser.getByteFrequencyData(freqData);
@@ -722,10 +876,15 @@ document.addEventListener("DOMContentLoaded", () => {
       drawCircular(); updateRing();
     }
 
+    // decay kick quickly
+    kick = Math.max(0.0, kick - 0.06);
+
+    // Local VAD handling: commit & kicks
     if (micActive) {
       const change = vadTick();
       if (change === "start") {
         hardStopAssistantAudio();
+        triggerKick(); // visual glitch pulse
         const now = performance.now();
         if (now - lastVADEmit > 120) { disturbOrb(); lastVADEmit = now; }
         silenceFrames = 0;
@@ -737,10 +896,14 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    updateOrbUniforms?.(t, level);
+    // also pump distortion with lowband energy
+    const low = getLowbandLevel();
+    const drive = THREE.MathUtils.clamp(level * 1.2 + low * 0.8, 0, 1.5);
+
+    updateOrbUniforms?.(t, drive, kick);
     updateBackground?.(t);
     if (orbGroup) {
-      const rotF = 1 + level * audioReactivity;
+      const rotF = 1 + drive * audioReactivity;
       orbGroup.rotation.y += 0.005 * rotationSpeed * rotF;
       orbGroup.rotation.z += 0.002 * rotationSpeed * rotF;
     }
