@@ -1,4 +1,8 @@
 # Real-Time Full-Duplex Voice Assistant <img alt="🎙️ Live Demo — com-cloud.cloud" src="https://img.shields.io/badge/%F0%9F%8E%99%EF%B8%8F%20Live%20Demo-com--cloud.cloud-orange?style=for-the-badge"/> </p>
+<video
+  src="https://github.com/leo007-htun/full_duplex_assistant/releases/download/v-media-1/full_duplex.mp4"
+  controls muted playsinline width="100%">
+</video>
 
 Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voice assistant with a web UI, streaming ASR, TTS, and LLM orchestration. Built for real conversations, barge-in, and hands-free control.
 
