@@ -71,38 +71,38 @@ services:
     environment:
       - ENABLE_VOICE=0
       - ALLOWED_ORIGINS=https://com-cloud.cloud
+      # If you ever switch to "assistant.app:app", uncomment the next line:
+      # - PYTHONPATH=/app/src
     expose:
       - "8000"
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
 
-      # ===== WebSocket router (if your app exposes /ws) =====
-      - "traefik.http.routers.ws.rule=Host(`com-cloud.cloud`) && PathPrefix(`/ws`)"
-      - "traefik.http.routers.ws.entrypoints=websecure"
-      - "traefik.http.routers.ws.tls=true"
-      - "traefik.http.routers.ws.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.ws.priority=100"
-      - "traefik.http.routers.ws.service=assistant-svc"
-      - "traefik.http.services.assistant-svc.loadbalancer.server.port=8000"
+      # Single Traefik service backing both routers
+      - "traefik.http.services.assistant.loadbalancer.server.port=8000"
 
-      # ===== REST router =====
+      # ===== REST router: https://com-cloud.cloud/api/* → (strip /api) → FastAPI =====
       - "traefik.http.routers.api.rule=Host(`com-cloud.cloud`) && PathPrefix(`/api`)"
       - "traefik.http.routers.api.entrypoints=websecure"
       - "traefik.http.routers.api.tls=true"
       - "traefik.http.routers.api.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.api.priority=50"
-      - "traefik.http.routers.api.service=assistant-svc"
-
-      # Strip /api before hitting FastAPI
-      - "traefik.http.middlewares.api-strip.stripprefix.prefixes=/api"
-      # Basic rate limit for token mint
+      - "traefik.http.routers.api.priority=100"
+      - "traefik.http.routers.api.service=assistant"
+      - "traefik.http.middlewares.strip-api.stripprefix.prefixes=/api"
       - "traefik.http.middlewares.api-ratelimit.ratelimit.average=10"
       - "traefik.http.middlewares.api-ratelimit.ratelimit.burst=20"
-      - "traefik.http.routers.api.middlewares=api-strip,api-ratelimit"
+      - "traefik.http.routers.api.middlewares=strip-api,api-ratelimit"
+
+      # ===== WebSocket router (optional if you expose /ws) =====
+      - "traefik.http.routers.ws.rule=Host(`com-cloud.cloud`) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.ws.entrypoints=websecure"
+      - "traefik.http.routers.ws.tls=true"
+      - "traefik.http.routers.ws.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.ws.priority=110"
+      - "traefik.http.routers.ws.service=assistant"
     healthcheck:
-      test:
-        ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
