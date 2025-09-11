@@ -759,7 +759,8 @@ document.addEventListener("DOMContentLoaded", () => {
         if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
           ws.send(JSON.stringify({
             type: "response.create",
-            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: currentOutRate, voice: "alloy" } }
+            //response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: currentOutRate, voice: "alloy" } }
+            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: 16000, voice: "alloy" } }
           }));
           return;
         }
