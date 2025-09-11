@@ -9,11 +9,8 @@
 </h1>
 
 <!-- Demo video (centered) -->
-<p align="center">
-<a href="https://github.com/leo007-htun/full_duplex_assistant/releases/download/v-media-1/full_duplex.mp4">
-  <img src="https://raw.githubusercontent.com/leo007-htun/full_duplex_assistant/main/media/thumbnail.jpg"
-       alt="Watch demo video" width="100%">
-</a>
+[![Watch the demo](https://img.youtube.com/vi/VIDEO_ID/hqdefault.jpg)](https://youtu.be/ioz0FZOchUY)
+
 
 </p>
 
