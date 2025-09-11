@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -13,6 +14,9 @@ if not OPENAI_API_KEY:
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 FRONTEND_ORIGINS = set(ALLOWED_ORIGINS or ["https://com-cloud.cloud"])
+ALLOWED_HOSTS = {(urlparse(o).netloc or o.replace("https://", "").replace("http://", ""))
+    for o in FRONTEND_ORIGINS
+}
 
 app = FastAPI(title="Full Duplex Assistant API", version="1.0.0")
 
@@ -81,3 +85,43 @@ async def rt_token():
     resp = JSONResponse(r.json())
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+@app.middleware("http")
+async def restrict_rt_token(request: Request, call_next):
+    # Only protect the token endpoint
+    if request.url.path.startswith("/rt-token"):
+        # CORS preflight (if any)
+        if request.method == "OPTIONS":
+            return JSONResponse({}, status_code=200)
+
+        origin  = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        host    = request.headers.get("host")  # e.g. "com-cloud.cloud"
+
+        # Allowed if:
+        # - Origin header is present AND whitelisted, OR
+        # - No Origin, but Host matches allowed hosts (same-origin GET), OR
+        # - Referer host matches allowed hosts (fallback)
+        allowed = False
+        if FRONTEND_ORIGINS:
+            if origin and origin in FRONTEND_ORIGINS:
+                allowed = True
+            elif host and host in ALLOWED_HOSTS:
+                allowed = True
+            elif referer:
+                ref_host = urlparse(referer).netloc
+                allowed = ref_host in ALLOWED_HOSTS
+        else:
+            # If no FRONTEND_ORIGINS configured, allow by default
+            allowed = True
+
+        if not allowed:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
+        # Basic IP rate-limit
+        client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+        if not allow(client_ip):
+            return JSONResponse({"error": "rate_limited"}, status_code=429)
+
+    return await call_next(request)
+
