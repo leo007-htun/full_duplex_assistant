@@ -43,5 +43,155 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
     │ │
     └─ Controls/Events → LLM Orchestrator
 
-### 🐋 Docker Stack & Routing
+#### 🐋 Docker Stack & Routing
 
+               ┌───────────────────────────┐
+               │        Internet            │
+               └────────────┬──────────────┘
+                            │  :80 / :443
+                            ▼
+                   ┌─────────────────┐
+                   │     Traefik     │
+                   │ (Reverse Proxy) │
+                   └───────┬─────────┘
+             ┌─────────────┼─────────────┐
+             │             │             │
+    ┌────────▼───┐   ┌─────▼─────┐   ┌──▼────────┐
+    │   /        │   │   /api    │   │   /ws     │
+    │   Web UI   │   │  Assistant│   │ Assistant │
+    │ (Nginx)    │   │ (FastAPI) │   │ (FastAPI) │
+    └────────────┘   └───────────┘   └───────────┘
+
+  
+#### Services in this repo
+
+- **traefik**: reverse proxy, automatic HTTPS via Let’s Encrypt.
+- **web**: static frontend (served by Nginx).
+- **assistant**: FastAPI backend (ASR, TTS, LLM orchestration, WebSockets).
+- **init_letsencrypt**: bootstrap storage for ACME certificates.
+
+---
+
+#### 🚀 Quick Start
+
+##### 1. Prerequisites
+- Docker & Docker Compose
+- Domain pointing to your server: [`com-cloud.cloud`](https://com-cloud.cloud)
+- DNS A/AAAA records configured
+- API keys for ASR, TTS, and LLM providers
+
+##### 2. Configure Environment
+
+Create `src/assistant/.env` with your secrets:
+
+    # LLM / Orchestrator
+    LLM_PROVIDER=openai
+    OPENAI_API_KEY=sk-...
+    
+    # ASR
+    ASR_PROVIDER=openai_realtime
+    ASR_API_KEY=...
+    
+    # TTS
+    TTS_PROVIDER=openai_realtime
+    TTS_API_KEY=...
+    
+    # CORS / ORIGINS
+    ALLOWED_ORIGINS=https://com-cloud.cloud
+    
+    # Optional
+    LOG_LEVEL=info
+
+
+#####🖥️ Local Development
+
+###### Run backend directly:
+
+    cd src/assistant
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    uvicorn assistant.app:app --reload --host 0.0.0.0 --port 8000
+
+##### Frontend
+    cd web
+    npm install
+    npm run dev
+
+#### 🎙️ Using the Assistant
+
+Open https://com-cloud.cloud
+.
+
+Click on ORB to Connect to establish WebSocket session.
+
+Speak naturally; interrupt the assistant mid-sentence.
+
+Watch live captions, hear real-time TTS playback.
+
+DONT FOTGET TO CLOSE THE TAB!!!
+
+#### ⚙️ Configuration
+
+Key options:
+
+ASR: model, language hints, VAD sensitivity.
+
+TTS: voice, speed, sample rate.
+
+LLM: model, temperature, tool schemas.
+
+Traefik: TLS challenge type, timeouts, rate limits.
+
+#### 🔌 API
+
+GET /healthz – service health
+
+WS /ws/asr – audio in ↔ transcript out
+
+WS /ws/assistant – dialog orchestration (events + responses)
+
+WS /ws/tts – text in ↔ audio out
+
+POST /api/tools/<name> – trigger server-side tool functions
+
+#### 🔐 Security
+
+HTTPS enforced (TLS via Let’s Encrypt + Traefik).
+
+Strict CORS (limited to https://com-cloud.cloud).
+
+API rate limiting enabled (/api).
+
+Secrets kept in .env (not in frontend).
+
+#### 📦 Deployment Notes
+
+Reverse proxy: Traefik v3 with ACME TLS challenge.
+
+Certificates stored in ./letsencrypt/acme.json.
+
+Static frontend served by Nginx (web service).
+
+Backend served via assistant (FastAPI) behind Traefik.
+
+Scale with Docker Swarm / k8s if needed.
+
+#### 🗺️ Roadmap
+
+ Wake-word hotword detection
+
+ Speaker diarization
+
+ Plug-and-play tool registry
+
+ Persistent transcripts
+
+ Multi-voice TTS
+
+#### 🤝 Contributing
+
+Fork this repo
+
+Create a feature branch
+
+Submit PR with screenshots/logs if UI/backend affected
