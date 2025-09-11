@@ -6,7 +6,13 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
   <img alt="full duplex assistant banner" src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
   <img alt="docker compose" src="https://img.shields.io/badge/docker-compose-0db7ed">
   <img alt="realtime" src="https://img.shields.io/badge/latency-~low-brightgreen">
-  [![🎙️ Live Demo — com-cloud.cloud](https://img.shields.io/badge/%F0%9F%8E%99%EF%B8%8F%20Live%20Demo-com--cloud.cloud-orange?style=for-the-badge)](https://com-cloud.cloud)
+  <a href="https://com-cloud.cloud" target="_blank" rel="noopener noreferrer">
+  <img
+    alt="🎙️ Live Demo — com-cloud.cloud"
+    src="https://img.shields.io/badge/%F0%9F%8E%99%EF%B8%8F%20Live%20Demo-com--cloud.cloud-orange?style=for-the-badge"
+  />
+</a>
+
 
 </p>
 
