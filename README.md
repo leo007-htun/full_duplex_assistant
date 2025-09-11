@@ -3,15 +3,22 @@
 Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voice assistant with a web UI, streaming ASR, TTS, and LLM orchestration. Built for real conversations, barge-in, and hands-free control.
 
 <p align="center">
-  <img alt="full duplex assistant banner" src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
-  <img alt="docker compose" src="https://img.shields.io/badge/docker-compose-0db7ed">
-  <img alt="realtime" src="https://img.shields.io/badge/latency-~low-brightgreen">
-  [![PyPI version](https://img.shields.io/pypi/v/full-duplex-assistant.svg)](https://pypi.org/project/full-duplex-assistant/)
-  <a href="https://com-cloud.cloud" target="_blank" rel="noopener noreferrer">
-</a>
-
-
+  <a href="https://pypi.org/project/full-duplex-assistant/">
+    <img alt="PyPI version"
+         src="https://img.shields.io/pypi/v/full-duplex-assistant.svg?logo=pypi&logoColor=white&label=PyPI">
+  </a>
+  <img alt="voice full duplex"
+       src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
+  <img alt="docker compose"
+       src="https://img.shields.io/badge/docker-compose-0db7ed?logo=docker&logoColor=white">
+  <img alt="latency low"
+       src="https://img.shields.io/badge/latency-low-brightgreen">
+  <a href="https://com-cloud.cloud" rel="noopener noreferrer">
+    <img alt="Website"
+         src="https://img.shields.io/badge/website-com--cloud.cloud-blue">
+  </a>
 </p>
+
 
 ---
 
