@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "full-duplex-assistant"         # must be unique on PyPI; change if taken
+version = "0.1.0"
+description = "Real-time full-duplex voice assistant (FastAPI backend)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Sithu Ye Htun (Leo)" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/leo007-htun/full_duplex_assistant"
+Issues = "https://github.com/leo007-htun/full_duplex_assistant/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/assistant"]
