@@ -30,16 +30,16 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
 
 ### Application Flow
 
-  Browser (Web UI)
-  ├─ Mic capture (WebAudio) → WebSocket → Assistant (FastAPI)
-  │ │
-  │ partial transcripts
-  │ ▼
-  ├─ Live captions ← ASR (streaming via Assistant)
-  │ │
-  │ ▼
-  ├─ TTS audio playback ← TTS (streaming chunks)
-  │ ▲
-  │ │
-  └─ Controls/Events → LLM Orchestrator
+    Browser (Web UI)
+    ├─ Mic capture (WebAudio) → WebSocket → Assistant (FastAPI)
+    │ │
+    │ partial transcripts
+    │ ▼
+    ├─ Live captions ← ASR (streaming via Assistant)
+    │ │
+    │ ▼
+    ├─ TTS audio playback ← TTS (streaming chunks)
+    │ ▲
+    │ │
+    └─ Controls/Events → LLM Orchestrator
 
