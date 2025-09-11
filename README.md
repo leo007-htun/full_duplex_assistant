@@ -103,16 +103,16 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
     LOG_LEVEL=info
 
 
-#### 3. 🖥️ Local Development
+##### 3. 🖥️ Local Development
 
-##### Run backend directly:
+###### Run backend directly:
 
     cd src/assistant
     python -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
     uvicorn assistant.app:app --reload --host 0.0.0.0 --port 8000
 
-##### Frontend
+###### Frontend
     cd web
     npm install
     npm run dev
