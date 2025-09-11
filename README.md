@@ -6,6 +6,8 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
   <a href="https://pypi.org/project/full-duplex-assistant/">
     <img alt="PyPI version"
          src="https://img.shields.io/pypi/v/full-duplex-assistant.svg?logo=pypi&logoColor=white&label=PyPI">
+    <img alt="JS SDK version"
+         src="https://img.shields.io/github/package-json/v/leo007-htun/full_duplex_assistant/sdk-js?label=SDK%20version">
   </a>
   <img alt="voice full duplex"
        src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
