@@ -103,7 +103,7 @@ Create `src/assistant/.env` with your secrets:
     LOG_LEVEL=info
 
 
-#####🖥️ Local Development
+####🖥️ Local Development
 
 ###### Run backend directly:
 
