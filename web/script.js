@@ -90,7 +90,7 @@ document.addEventListener("DOMContentLoaded", () => {
       analyser.smoothingTimeConstant = 0.85;
       audioData = new Float32Array(analyser.fftSize);
       freqData = new Uint8Array(analyser.frequencyBinCount);
-      notify("AUDIO ANALYZER READY • TAP TO ENABLE MIC", "ok", 2200);
+      notify("AUDIO ANALYZER READY • TAP ANYWHERE TO ENABLE MIC", "ok", 2200);
     } catch (e) {
       console.error(e);
       notify("AUDIO INIT ERROR", "error", 4000);
@@ -296,23 +296,17 @@ document.addEventListener("DOMContentLoaded", () => {
     const g = new THREE.BufferGeometry();
     const count = 2800;
     const pos = new Float32Array(count * 3);
-    const col = new Float32Array(count * 3);
-    const c1 = new THREE.Color(0x66e6ff), c2 = new THREE.Color(0x2fb3ff), c3 = new THREE.Color(0x8de6ff);
     for (let i = 0; i < count; i++) {
       pos[i * 3] = (Math.random() - 0.5) * 110;
       pos[i * 3 + 1] = (Math.random() - 0.5) * 110;
       pos[i * 3 + 2] = (Math.random() - 0.5) * 110;
-      const pick = Math.random(); const c = pick < .34 ? c1 : pick < .67 ? c2 : c3;
-      col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
     }
     g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
     const m = new THREE.ShaderMaterial({
       uniforms: { time: { value: 0 } },
       vertexShader: `
-        varying vec3 vColor; uniform float time;
+        uniform float time;
         void main(){
-          vColor = color;
           vec3 p = position;
           p.x += sin(time*0.1 + position.z*0.2)*0.06;
           p.y += cos(time*0.1 + position.x*0.2)*0.06;
@@ -321,14 +315,13 @@ document.addEventListener("DOMContentLoaded", () => {
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader: `
-        varying vec3 vColor;
         void main(){
           float r = distance(gl_PointCoord, vec2(0.5));
           if (r > 0.5) discard;
           float glow = pow(1.0 - r*2.0, 2.0);
-          gl_FragColor = vec4(vColor, glow);
+          gl_FragColor = vec4(vec3(0.55,0.85,1.0), glow);
         }`,
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexColors: true
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
     });
     const pts = new THREE.Points(g, m); scene.add(pts);
     return (time) => { m.uniforms.time.value = time; };
@@ -513,7 +506,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const transcriptEl = document.getElementById("transcript-stream");
   let ws = null, wsOpen = false;
-  let currentOutRate = 24000; // will be updated to your device rate
+
+  // Single source of truth for output sample rate
+  let currentOutRate = 24000; // will be set to your device-friendly rate
 
   function appendAssistantText(delta) {
     if (!delta) return;
@@ -553,7 +548,7 @@ document.addEventListener("DOMContentLoaded", () => {
   class PCMPlayer {
     constructor() {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      this.sampleRate = this.ctx.sampleRate;  // usually 48000
+      this.sampleRate = this.ctx.sampleRate;  // usually 48000 on desktop, 44100/48000 on mobile
       this.serverRate = this.sampleRate;
       this.node = null;
       this.started = false;
@@ -595,7 +590,7 @@ document.addEventListener("DOMContentLoaded", () => {
       await this.ctx.audioWorklet.addModule(url);
       this.node = new AudioWorkletNode(this.ctx, 'pcm-feeder');
 
-      // Mastering chain
+      // Mastering chain (warm, de-ting)
       this.gain = this.ctx.createGain();
       this.gain.gain.value = 1.35;
 
@@ -720,13 +715,12 @@ document.addEventListener("DOMContentLoaded", () => {
       ws = sock; wsOpen = true; everAppended = false; appendedMsSinceCommit = 0; lastCommitAt = performance.now();
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
-      // Pick output rate that matches device (avoid resampling / chipmunk)
+      // Choose device-friendly output rate and lock everything to it
       const deviceRate = pcmPlayer?.sampleRate || (new (window.AudioContext || window.webkitAudioContext)()).sampleRate;
       const preferredRates = [48000, 44100, 24000];
-      const desiredOutRate = preferredRates.find(r => Math.abs(r - deviceRate) < 2000) || 48000;
-      currentOutRate = desiredOutRate;
-      console.log("[AUDIO] deviceRate=", deviceRate, "desiredOutRate=", desiredOutRate);
-      pcmPlayer?.setServerRate(desiredOutRate);
+      currentOutRate = preferredRates.find(r => Math.abs(r - deviceRate) < 2000) || 48000;
+      console.log("[AUDIO] deviceRate=", deviceRate, "→ currentOutRate=", currentOutRate);
+      pcmPlayer?.setServerRate(currentOutRate);
 
       ws.send(JSON.stringify({
         type: "session.update",
@@ -737,9 +731,8 @@ document.addEventListener("DOMContentLoaded", () => {
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           input_audio_noise_reduction: { type: "near_field" },
 
-          // **OpenAI TTS voice + output rate**
           output_audio_format: "pcm16",
-          output_audio_sample_rate_hz: desiredOutRate,
+          output_audio_sample_rate_hz: currentOutRate, // <— key
           voice: "alloy",
 
           turn_detection: { type: "server_vad", threshold: 0.1, prefix_padding_ms: 300, silence_duration_ms: 1000 },
@@ -759,22 +752,19 @@ document.addEventListener("DOMContentLoaded", () => {
         if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
           ws.send(JSON.stringify({
             type: "response.create",
-            //response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: currentOutRate, voice: "alloy" } }
-            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: 16000, voice: "alloy" } }
+            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: currentOutRate, voice: "alloy" } }
           }));
           return;
         }
-
         if (t === "response.created") { bumpGeneration(); pcmPlayer?.clear(); return; }
 
         if (t === "response.output_audio.start" || t === "response.audio.start") {
-          if (msg?.sample_rate_hz) {
-            console.log("[AUDIO] server sample rate from event:", msg.sample_rate_hz);
-            currentOutRate = msg.sample_rate_hz;
-            pcmPlayer?.setServerRate(currentOutRate);
-          } else {
-            pcmPlayer?.setServerRate(currentOutRate);
+          const sr = msg?.sample_rate_hz;
+          if (sr) {
+            console.log("[AUDIO] server start rate:", sr);
+            currentOutRate = sr; // trust server if it echoes back
           }
+          pcmPlayer?.setServerRate(currentOutRate);
           return;
         }
 
@@ -924,7 +914,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const armMic = async (ev) => {
     if (micArmed) return;
     micArmed = true;
-    ev?.preventDefault?.();
+    ev?.preventDefault?.();   // helps iOS treat it as a real gesture
     await enableMicAndRealtime();
   };
   window.addEventListener("pointerdown", armMic, { once: true, passive: false });
