@@ -10,15 +10,11 @@
 
 <!-- Demo video (centered) -->
 <p align="center">
-  <video
-    src="https://github.com/leo007-htun/full_duplex_assistant/releases/full_duplex.mp4"
-    controls
-    muted
-    playsinline
-    width="100%">
-    Your browser doesn’t support embedded videos.
-    <a href="https://github.com/leo007-htun/full_duplex_assistant/releases/download/v-media-1/full_duplex.mp4">Download the video</a>.
-  </video>
+<a href="https://github.com/leo007-htun/full_duplex_assistant/releases/download/v-media-1/full_duplex.mp4">
+  <img src="https://raw.githubusercontent.com/leo007-htun/full_duplex_assistant/main/media/thumbnail.jpg"
+       alt="Watch demo video" width="100%">
+</a>
+
 </p>
 
 <p align="center">
