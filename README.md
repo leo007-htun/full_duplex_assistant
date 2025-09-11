@@ -11,7 +11,7 @@
 <!-- Demo video (centered) -->
 <p align="center">
   <video
-    src="https://github.com/leo007-htun/full_duplex_assistant/releases/download/v-media-1/full_duplex.mp4"
+    src="https://github.com/leo007-htun/full_duplex_assistant/releases/full_duplex.mp4"
     controls
     muted
     playsinline
