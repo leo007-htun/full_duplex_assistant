@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Use a requirements file for layer caching; pin minimal versions
-COPY src/assistant/requirements.txt ./requirements.txt
+COPY src/assistant/utils/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app
