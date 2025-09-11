@@ -6,6 +6,7 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
   <img alt="full duplex assistant banner" src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
   <img alt="docker compose" src="https://img.shields.io/badge/docker-compose-0db7ed">
   <img alt="realtime" src="https://img.shields.io/badge/latency-~low-brightgreen">
+  [![PyPI version](https://img.shields.io/pypi/v/full-duplex-assistant.svg)](https://pypi.org/project/full-duplex-assistant/)
   <a href="https://com-cloud.cloud" target="_blank" rel="noopener noreferrer">
 </a>
 
