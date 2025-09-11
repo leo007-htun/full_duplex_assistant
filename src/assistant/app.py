@@ -14,6 +14,8 @@ if not OPENAI_API_KEY:
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 FRONTEND_ORIGINS = set(ALLOWED_ORIGINS or ["https://com-cloud.cloud"])
+
+#middleware blocked anything without Origin → 403
 ALLOWED_HOSTS = {(urlparse(o).netloc or o.replace("https://", "").replace("http://", ""))
     for o in FRONTEND_ORIGINS
 }
@@ -47,19 +49,6 @@ def allow(ip: str) -> bool:
         b["tokens"] -= 1.0
         return True
     return False
-
-@app.middleware("http")
-async def restrict_rt_token(request: Request, call_next):
-    # Only the frontend origin can mint tokens
-    if request.url.path.startswith("/rt-token"):
-        origin = request.headers.get("origin", "")
-        if origin not in FRONTEND_ORIGINS:
-            return JSONResponse({"error": "forbidden"}, status_code=403)
-        # Basic IP rate-limit
-        client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
-        if not allow(client_ip):
-            return JSONResponse({"error": "rate_limited"}, status_code=429)
-    return await call_next(request)
 
 @app.get("/healthz")
 async def healthz():
