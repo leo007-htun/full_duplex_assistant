@@ -1,3 +1,4 @@
+
 import * as THREE from "https://esm.sh/three@0.175.0";
 import { OrbitControls } from "https://esm.sh/three@0.175.0/examples/jsm/controls/OrbitControls.js";
 
@@ -549,7 +550,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const TOKEN_ENDPOINT = IS_LOCAL ? "http://127.0.0.1:8000/rt-token" : "/api/rt-token";
 
   const transcriptEl = document.getElementById("transcript-stream");
-  let ws = null, wsOpen = false;
+  let ws = null, 
+  wsOpen = false;
+  let captureNode = null;
+  let appendedMsSinceCommit = 0;
+  let everAppended = false;
+  let lastCommitAt = 0;
+
 
   function appendAssistantText(delta) {
     if (!delta) return;
@@ -790,8 +797,7 @@ document.addEventListener("DOMContentLoaded", () => {
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
       // Use actual device rate to avoid resampling
-      const desiredOutRate = 24000;
-        (pcmPlayer && pcmPlayer.sampleRate) ? pcmPlayer.sampleRate : 24000;
+      const desiredOutRate = (pcmPlayer && pcmPlayer.sampleRate) ? pcmPlayer.sampleRate : 24000;
       if (pcmPlayer) pcmPlayer.setServerRate(desiredOutRate);
       
       ws.send(JSON.stringify({
@@ -836,7 +842,7 @@ document.addEventListener("DOMContentLoaded", () => {
           ws.send(JSON.stringify({
             type: "response.create",
             response: { modalities: ["text","audio"], 
-              audio: { format: "pcm16", sample_rate_hz: OUTPUT_RATE, voice: "alloy" } }
+              audio: { format: "pcm16", sample_rate_hz: desiredOutRate, voice: "alloy" } }
           }));
           return;
         }
@@ -848,7 +854,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (t === "response.output_audio.start" || t === "response.audio.start") {
           if (msg?.sample_rate_hz) pcmPlayer?.setServerRate(msg.sample_rate_hz);
-          else pcmPlayer?.setServerRate(OUTPUT_RATE);
+          else pcmPlayer?.setServerRate(msg.sample_rate_hz);
           return;
         }
 
