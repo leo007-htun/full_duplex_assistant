@@ -35,12 +35,13 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./src/assistant/utils/Dockerfile
+          file: ./Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
             sithuyehtun/full_duplex_assistant:latest
             sithuyehtun/full_duplex_assistant:${{ steps.vars.outputs.sha_short }}
+
   deploy:
     needs: build_push
     runs-on: ubuntu-latest
@@ -51,84 +52,70 @@ jobs:
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SERVER_SSH_KEY }}   # Prefer key auth
           port: 22
           debug: true
           command_timeout: 40m
           script_stop: true
           script: |
             set -euo pipefail
-      
-            echo "== connected =="
-            whoami || true
-            uname -a || true
-            date
-      
-            # ==== Compose detection (NO unguarded calls) ====
+            echo "== connected =="; whoami || true; uname -a || true; date
+
             if docker compose version >/dev/null 2>&1; then
               COMPOSE="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
             else
-              echo "❌ Neither 'docker compose' nor 'docker-compose' is installed."; exit 1
+              echo "❌ Neither 'docker compose' nor 'docker-compose' installed"; exit 1
             fi
-            echo "Using COMPOSE=$COMPOSE"
-            $COMPOSE version || true
-      
+
             REPO_PATH="${{ secrets.SERVER_PATH }}"
-            echo "REPO_PATH=$REPO_PATH"
-      
-            echo "== prepare repo =="
             mkdir -p "$REPO_PATH"
+
             if [ ! -d "$REPO_PATH/.git" ]; then
               git clone https://github.com/${{ github.repository }} "$REPO_PATH"
             fi
+
             cd "$REPO_PATH"
             git fetch --all --prune
             git reset --hard origin/main
-      
-            echo "== detect compose file =="
+
+            # Detect compose file
             COMPOSE_FILE=""
             for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
               if [ -f "$f" ]; then COMPOSE_FILE="$f"; break; fi
             done
             if [ -z "$COMPOSE_FILE" ]; then
-              echo "❌ No compose file found in $(pwd)"; ls -la; exit 1
+              echo "❌ No compose file found"; ls -la; exit 1
             fi
-            echo "Using compose file: $COMPOSE_FILE"
             $COMPOSE -f "$COMPOSE_FILE" config >/dev/null
-      
-            echo "== write env files =="
+
+            # Write app env
             mkdir -p src/assistant
             printf 'OPENAI_API_KEY=%s\nALLOWED_ORIGINS=%s\nENABLE_VOICE=0\n' \
               "${{ secrets.OPENAI_API_KEY }}" "https://com-cloud.cloud" \
               > src/assistant/.env
-      
+
+            # Write compose env
             printf 'LE_EMAIL=%s\nIMAGE_TAG=%s\n' \
               "${{ secrets.LE_EMAIL }}" "${{ needs.build_push.outputs.tag }}" \
               > .env
-      
-            echo "== ensure ACME store (bind mount ./letsencrypt) =="
+
+            # Ensure ACME store
             mkdir -p ./letsencrypt
             [ -f ./letsencrypt/acme.json ] || : > ./letsencrypt/acme.json
-            chmod 600 ./letsencrypt/acme.json || true
-            ls -l ./letsencrypt || true
-      
-            echo "== stop project only =="
+            chmod 600 ./letsencrypt/acme.json
+
+            # Pull pinned tag (just in case cache is stale)
+            docker pull sithuyehtun/full_duplex_assistant:${{ needs.build_push.outputs.tag }} || true
+
+            # Restart stack
             $COMPOSE -f "$COMPOSE_FILE" down --remove-orphans || true
-      
-            echo "== prune unused =="
             docker image prune -af || true
-            docker builder prune -af || true
-      
-            echo "== pull & up =="
-            $COMPOSE -f "$COMPOSE_FILE" pull
             $COMPOSE -f "$COMPOSE_FILE" up -d --remove-orphans
-      
-            echo "== ps =="
             $COMPOSE -f "$COMPOSE_FILE" ps || true
-      
-            echo "== local https check =="
+
+            # Local HTTPS check via SNI
             for i in {1..30}; do
               if curl -fsSIk https://127.0.0.1 -H "Host: com-cloud.cloud" >/dev/null 2>&1; then
                 echo "Local HTTPS OK"; break
@@ -136,8 +123,8 @@ jobs:
               sleep 2
               if [ $i -eq 30 ]; then echo "Local HTTPS FAILED"; exit 1; fi
             done
-      
-            echo "== public https check =="
+
+            # Public HTTPS check
             for i in {1..30}; do
               if curl -fsSIk https://com-cloud.cloud/ >/dev/null 2>&1; then
                 echo "Public HTTPS OK"; break
@@ -145,5 +132,5 @@ jobs:
               sleep 5
               if [ $i -eq 30 ]; then echo "Public HTTPS FAILED"; exit 1; fi
             done
-      
+
             echo "Deployed tag: ${{ needs.build_push.outputs.tag }}"
