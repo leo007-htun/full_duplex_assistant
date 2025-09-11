@@ -535,9 +535,7 @@ document.addEventListener("DOMContentLoaded", () => {
   })();
 
   // Token endpoint (your server returns ephemeral token)
-  //const TOKEN_ENDPOINT = `${API_BASE}/rt-token`;
-  const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.protocol === "file:";
-  const TOKEN_ENDPOINT = IS_LOCAL ? "http://127.0.0.1:8000/rt-token" : "/api/rt-token";
+  const TOKEN_ENDPOINT = `${API_BASE}/rt-token`;
 
   const transcriptEl = document.getElementById("transcript-stream");
 
@@ -1097,7 +1095,6 @@ document.addEventListener("DOMContentLoaded", () => {
       notify("MIC PERMISSION DENIED", "error", 4000);
     }
   }
-
 // Activate mic on any user gesture (mouse/touch/pen/keyboard)
 let micArmed = false;
 
@@ -1119,4 +1116,5 @@ window.addEventListener("click", armMic, { once: true });
 window.addEventListener("keydown", (e) => {
   if (!micArmed && (e.key === " " || e.key === "Enter")) armMic(e);
 }, { once: true });
+
 });
