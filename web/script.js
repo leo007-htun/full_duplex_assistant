@@ -535,7 +535,10 @@ document.addEventListener("DOMContentLoaded", () => {
   })();
 
   // Token endpoint (your server returns ephemeral token)
-  const TOKEN_ENDPOINT = `${API_BASE}/rt-token`;
+  //const TOKEN_ENDPOINT = `${API_BASE}/rt-token`;
+  const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.protocol === "file:";
+  const TOKEN_ENDPOINT = IS_LOCAL ? "http://127.0.0.1:8000/rt-token" : "/api/rt-token";
+
 
   const transcriptEl = document.getElementById("transcript-stream");
 
