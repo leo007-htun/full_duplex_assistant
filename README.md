@@ -3,25 +3,26 @@
 Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voice assistant with a web UI, streaming ASR, TTS, and LLM orchestration. Built for real conversations, barge-in, and hands-free control.
 
 <p align="center">
+  <!-- PyPI badge (Python) -->
   <a href="https://pypi.org/project/full-duplex-assistant/">
-    <img alt="PyPI version"
-         src="https://img.shields.io/pypi/v/full-duplex-assistant.svg?logo=pypi&logoColor=white&label=PyPI">
-    <img alt="JS SDK version"
-         src="https://img.shields.io/github/package-json/v/leo007-htun/full_duplex_assistant/sdk-js?label=SDK%20version">
+    <img alt="PyPI"
+         src="https://img.shields.io/pypi/v/full-duplex-assistant.svg?logo=pypi&label=PyPI">
+  </a>
 
+  <!-- Latest JS tag badge (shows latest js-v* tag) -->
+  <a href="https://github.com/leo007-htun/full_duplex_assistant/releases">
+    <img alt="JS SDK (latest tag)"
+         src="https://img.shields.io/github/v/tag/leo007-htun/full_duplex_assistant?label=JS%20SDK&filter=js-v%2A">
   </a>
-  <img alt="voice full duplex"
-       src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
-  <img alt="docker compose"
-       src="https://img.shields.io/badge/docker-compose-0db7ed?logo=docker&logoColor=white">
-  <img alt="latency low"
-       src="https://img.shields.io/badge/latency-low-brightgreen">
-  <a href="https://com-cloud.cloud" rel="noopener noreferrer">
-    <img alt="Website"
-         src="https://img.shields.io/badge/website-com--cloud.cloud-blue">
-  </a>
+
+  <!-- JS package.json version from sdk-js/ (reads file from repo) -->
+  <img alt="JS SDK version"
+       src="https://img.shields.io/github/package-json/v/leo007-htun/full_duplex_assistant?filename=sdk-js/package.json&label=SDK%20version">
+
+  <img alt="voice full duplex" src="https://img.shields.io/badge/voice-full--duplex-4A90E2">
+  <img alt="docker compose" src="https://img.shields.io/badge/docker-compose-0db7ed?logo=docker&logoColor=white">
+  <img alt="latency low" src="https://img.shields.io/badge/latency-low-brightgreen">
 </p>
-
 
 ---
 
