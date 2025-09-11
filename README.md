@@ -56,26 +56,26 @@ Typical services:
 
 Create a `.env` at the repo root (example—rename keys to your providers):
 
-```bash
-# LLM / Orchestrator
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...
 
-# ASR
-ASR_PROVIDER=openai_realtime   # or deepgram, local-whisper, etc.
-ASR_API_KEY=...
-
-# TTS
-TTS_PROVIDER=openai_realtime   # or elevenlabs, edge, etc.
-TTS_API_KEY=...
-
-# CORS / ORIGINS
-ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
-
-# Optional
-LOG_LEVEL=info
-3) Bring up the stack
-docker compose up --build
+    # LLM / Orchestrator
+    LLM_PROVIDER=openai
+    OPENAI_API_KEY=sk-...
+    
+    # ASR
+    ASR_PROVIDER=openai_realtime   # or deepgram, local-whisper, etc.
+    ASR_API_KEY=...
+    
+    # TTS
+    TTS_PROVIDER=openai_realtime   # or elevenlabs, edge, etc.
+    TTS_API_KEY=...
+    
+    # CORS / ORIGINS
+    ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
+    
+    # Optional
+    LOG_LEVEL=info
+    3) Bring up the stack
+    docker compose up --build
 
 
 Web UI: http://localhost
@@ -91,19 +91,19 @@ Use this if you prefer running services directly.
 
 Backend
 
-cd src
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+    cd src
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 
 Exposes REST + WS endpoints at http://localhost:8000.
 
 Web UI
 
-cd web
-npm i
-npm run dev
+    cd web
+    npm i
+    npm run dev
 
 
 Set the UI .env (e.g., VITE_API_BASE=http://localhost:8000).
