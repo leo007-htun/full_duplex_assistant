@@ -741,7 +741,7 @@ document.addEventListener("DOMContentLoaded", () => {
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
       // Use actual device rate to avoid resampling
-      const OUTPUT_RATE = pcmPlayer?.sampleRate || 48000;
+      const OUTPUT_RATE = pcmPlayer?.sampleRate || 16000;
       pcmPlayer?.setServerRate(OUTPUT_RATE);
 
       ws.send(JSON.stringify({
@@ -932,5 +932,26 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  window.addEventListener("click", () => { enableMicAndRealtime(); }, { once: true });
+// Activate mic on any user gesture (mouse/touch/pen/keyboard)
+let micArmed = false;
+
+const armMic = async (ev) => {
+  if (micArmed) return;
+  micArmed = true;
+  ev?.preventDefault?.();   // helps iOS treat it as a real gesture
+  await enableMicAndRealtime();
+};
+
+// Pointer covers mouse, touch, pen on modern browsers
+window.addEventListener("pointerdown", armMic, { once: true, passive: false });
+
+// Fallbacks for older mobile/Safari
+window.addEventListener("touchend", armMic, { once: true, passive: false });
+window.addEventListener("click", armMic, { once: true });
+
+// Optional: keyboard access (Space/Enter)
+window.addEventListener("keydown", (e) => {
+  if (!micArmed && (e.key === " " || e.key === "Enter")) armMic(e);
+}, { once: true });
+
 });
