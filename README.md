@@ -10,9 +10,8 @@
 
 <!-- Demo video (centered) -->
 <p align="center">
-  <a href="https://youtu.be/ioz0FZOchUY" target="_blank" rel="noopener">
-    <img src="https://img.youtube.com/vi/ioz0FZOchUY/hqdefault.jpg" alt="Watch the demo" width="800">
-  </a>
+[![Watch the demo](https://img.youtube.com/vi/ioz0FZOchUY/maxresdefault.jpg)](https://youtu.be/ioz0FZOchUY)
+
 </p>
 
 
