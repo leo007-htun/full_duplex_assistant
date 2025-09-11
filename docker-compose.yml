@@ -61,7 +61,7 @@ services:
   assistant:
     image: sithuyehtun/full_duplex_assistant:${IMAGE_TAG:-latest}
     command: >
-      uvicorn assistant.app:app
+      uvicorn src.assistant.app:app
       --host 0.0.0.0
       --port 8000
       --proxy-headers
