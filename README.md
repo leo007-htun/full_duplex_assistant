@@ -9,10 +9,14 @@
 </h1>
 
 <!-- Demo video (centered) -->
-[![Watch the demo](https://img.youtube.com/vi/VIDEO_ID/hqdefault.jpg)](https://youtu.be/ioz0FZOchUY)
-
-
+<p align="center">
+  <a href="https://youtu.be/ioz0FZOchUY" target="_blank" rel="noopener">
+    <img src="https://img.youtube.com/vi/ioz0FZOchUY/hqdefault.jpg" alt="Watch the demo" width="800">
+  </a>
 </p>
+
+
+
 
 <p align="center">
   Low-latency, interruptible, <b>full-duplex</b> (talk &amp; listen at the same time) voice assistant with a web UI, streaming ASR, TTS, and LLM orchestration. Built for real conversations, barge-in, and hands-free control.
