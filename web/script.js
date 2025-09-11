@@ -90,7 +90,7 @@ document.addEventListener("DOMContentLoaded", () => {
       analyser.smoothingTimeConstant = 0.85;
       audioData = new Float32Array(analyser.fftSize);
       freqData = new Uint8Array(analyser.frequencyBinCount);
-      notify("AUDIO ANALYZER READY • TAP THE ORB TO ENABLE MIC", "ok", 2200);
+      notify("AUDIO ANALYZER READY • TAP TO ENABLE MIC", "ok", 2200);
     } catch (e) {
       console.error(e);
       notify("AUDIO INIT ERROR", "error", 4000);
@@ -245,17 +245,15 @@ document.addEventListener("DOMContentLoaded", () => {
   let clock = new THREE.Clock();
   let rotationSpeed = 1.0, distortionAmount = 1.0, resolution = 32;
 
-  // audio → lowband energy for distortion drive
   function getLowbandLevel() {
     if (!analyser || !freqData) return 0;
     analyser.getByteFrequencyData(freqData);
-    const take = Math.max(8, Math.floor(freqData.length * 0.08)); // lowest ~8% bins
+    const take = Math.max(8, Math.floor(freqData.length * 0.08));
     let s = 0;
     for (let i = 0; i < take; i++) s += freqData[i];
     return (s / (take * 255));
   }
 
-  // short glitch kick envelope
   let kick = 0.0;
   function triggerKick() { kick = 1.0; }
 
@@ -351,20 +349,19 @@ document.addEventListener("DOMContentLoaded", () => {
         kick: { value: 0.0 }
       },
       vertexShader: `
-        // 3D simplex noise (iq)
         vec3 mod289(vec3 x){return x - floor(x * (1.0/289.0)) * 289.0;}
         vec4 mod289(vec4 x){return x - floor(x * (1.0/289.0)) * 289.0;}
         vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
         vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
         float snoise(vec3 v){
-          const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
-          const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
-          vec3 i  = floor(v + dot(v, C.yyy) );
-          vec3 x0 = v - i + dot(i, C.xxx) ;
+          const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+          const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+          vec3 i = floor(v + dot(v, C.yyy));
+          vec3 x0 = v - i + dot(i, C.xxx);
           vec3 g = step(x0.yzx, x0.xyz);
           vec3 l = 1.0 - g;
-          vec3 i1 = min( g.xyz, l.zxy );
-          vec3 i2 = max( g.xyz, l.zxy );
+          vec3 i1 = min(g.xyz, l.zxy);
+          vec3 i2 = max(g.xyz, l.zxy);
           vec3 x1 = x0 - i1 + C.xxx;
           vec3 x2 = x0 - i2 + C.yyy;
           vec3 x3 = x0 - D.yyy;
@@ -386,8 +383,8 @@ document.addEventListener("DOMContentLoaded", () => {
           vec4 s0 = floor(b0)*2.0 + 1.0;
           vec4 s1 = floor(b1)*2.0 + 1.0;
           vec4 sh = -step(h, vec4(0.0));
-          vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
-          vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+          vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+          vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
           vec3 p0 = vec3(a0.xy,h.x);
           vec3 p1 = vec3(a1.zw,h.y);
           vec3 p2 = vec3(a1.xy,h.z);
@@ -399,33 +396,21 @@ document.addEventListener("DOMContentLoaded", () => {
           return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
                                         dot(p2,x2), dot(p3,x3) ) );
         }
-
         uniform float time, audioLevel, distortion, kick;
         varying vec3 vN; varying vec3 vP;
-
         void main(){
           vN = normalize(normalMatrix * normal);
           float t = time * 0.35;
-
-          // base sphere pos
           vec3 p = position;
-
-          // multi-band noise (warmer near “poles”)
           float n1 = snoise(p*0.55 + vec3(t, 0.0, 0.0));
           float n2 = snoise(p*1.1  + vec3(0.0, t*0.6, 0.0));
           float n = n1*0.7 + n2*0.3;
-
-          // audio-reactive amplitude + short glitch kick
           float audioAmt = audioLevel * 0.85;
-          float kickAmt  = kick * 0.85; // fades every frame in JS
+          float kickAmt  = kick * 0.85;
           float wobble = (0.22 * distortion) * (1.0 + audioAmt*1.6 + kickAmt);
-
-          // add a little ridged turbulence
           float ridge = abs(snoise(p*2.2 + t*0.8));
           float disp  = n * wobble + ridge * 0.06 * (1.0 + audioAmt);
-
           p += normalize(normal) * disp;
-
           vP = p;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
         }`,
@@ -435,14 +420,11 @@ document.addEventListener("DOMContentLoaded", () => {
         void main(){
           vec3 N = normalize(vN);
           vec3 V = normalize(cameraPosition - vP);
-
           float fres = 1.0 - max(0.0, dot(V, N));
           fres = pow(fres, 2.2 + audioLevel*2.5 + kick*1.2);
-
           float pulse = 0.7 + 0.3*sin(time*2.0 + kick*4.0);
           vec3  col   = color * fres * pulse * (1.0 + audioLevel*0.8 + kick*0.4);
           float a     = fres * (0.75 - audioLevel*0.3);
-
           gl_FragColor = vec4(col, a);
         }`,
       wireframe: true,
@@ -479,7 +461,6 @@ document.addEventListener("DOMContentLoaded", () => {
       mat.uniforms.audioLevel.value = level;
       mat.uniforms.distortion.value = distortionAmount;
       mat.uniforms.kick.value = kickVal;
-
       glowMat.uniforms.time.value = time;
       glowMat.uniforms.audioLevel.value = level;
       glowMat.uniforms.kick.value = kickVal;
@@ -503,7 +484,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const holder = document.getElementById("floating-particles");
     if (!holder) return;
     holder.innerHTML = ""; domParticles.length = 0;
-    const count = 500, w = innerWidth, h = innerHeight, cx = w / 2, cy = h / 2;
+    const count = 500;
     for (let i = 0; i < count; i++) {
       const el = document.createElement("div");
       el.style.position = "absolute"; el.style.width = "2px"; el.style.height = "2px"; el.style.borderRadius = "50%";
@@ -532,6 +513,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const transcriptEl = document.getElementById("transcript-stream");
   let ws = null, wsOpen = false;
+  let currentOutRate = 24000; // will be updated to your device rate
 
   function appendAssistantText(delta) {
     if (!delta) return;
@@ -576,7 +558,6 @@ document.addEventListener("DOMContentLoaded", () => {
       this.node = null;
       this.started = false;
       this.activeGen = 0;
-      // mastering nodes
       this.gain = null; this.lowShelf = null; this.presenceCut = null; this.highShelf = null; this.comp = null;
     }
     async init() {
@@ -616,7 +597,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
       // Mastering chain
       this.gain = this.ctx.createGain();
-      this.gain.gain.value = 1.35; // 1.0–1.6
+      this.gain.gain.value = 1.35;
 
       this.lowShelf = this.ctx.createBiquadFilter();
       this.lowShelf.type = "lowshelf";
@@ -641,7 +622,6 @@ document.addEventListener("DOMContentLoaded", () => {
       this.comp.attack.value = 0.005;
       this.comp.release.value = 0.08;
 
-      // Connect: feeder → gain → lowshelf → presenceCut → highshelf → comp → out
       this.node.connect(this.gain);
       this.gain.connect(this.lowShelf);
       this.lowShelf.connect(this.presenceCut);
@@ -740,37 +720,32 @@ document.addEventListener("DOMContentLoaded", () => {
       ws = sock; wsOpen = true; everAppended = false; appendedMsSinceCommit = 0; lastCommitAt = performance.now();
       notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
-      // Use actual device rate to avoid resampling
+      // Pick output rate that matches device (avoid resampling / chipmunk)
       const deviceRate = pcmPlayer?.sampleRate || (new (window.AudioContext || window.webkitAudioContext)()).sampleRate;
-      // Normalize to a rate the API supports (prefer 48000, else 44100, else 24000)
       const preferredRates = [48000, 44100, 24000];
       const desiredOutRate = preferredRates.find(r => Math.abs(r - deviceRate) < 2000) || 48000;
-      
+      currentOutRate = desiredOutRate;
       console.log("[AUDIO] deviceRate=", deviceRate, "desiredOutRate=", desiredOutRate);
       pcmPlayer?.setServerRate(desiredOutRate);
-      
+
       ws.send(JSON.stringify({
         type: "session.update",
         session: {
-          // mic in
           input_audio_format: "pcm16",
           input_audio_sample_rate_hz: 16000,
           input_audio_channels: 1,
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           input_audio_noise_reduction: { type: "near_field" },
-      
-          // TTS out -> **force the server to match device**
+
+          // **OpenAI TTS voice + output rate**
           output_audio_format: "pcm16",
           output_audio_sample_rate_hz: desiredOutRate,
-      
-          // voice timbre affects “tinny” perception too
-          voice: "alloy", // try "alloy" (warmer) or "verse"
-      
+          voice: "alloy",
+
           turn_detection: { type: "server_vad", threshold: 0.1, prefix_padding_ms: 300, silence_duration_ms: 1000 },
           instructions: "You are Jarvis. Be concise, helpful, and speak in short, friendly, energetic sentences."
         }
       }));
-
 
       startMicPCMStream(userMediaStream);
 
@@ -784,15 +759,21 @@ document.addEventListener("DOMContentLoaded", () => {
         if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
           ws.send(JSON.stringify({
             type: "response.create",
-            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: OUTPUT_RATE, voice: "alloy" } }
+            response: { modalities: ["text","audio"], audio: { format: "pcm16", sample_rate_hz: currentOutRate, voice: "alloy" } }
           }));
           return;
         }
+
         if (t === "response.created") { bumpGeneration(); pcmPlayer?.clear(); return; }
 
         if (t === "response.output_audio.start" || t === "response.audio.start") {
-          if (msg?.sample_rate_hz) pcmPlayer?.setServerRate(msg.sample_rate_hz);
-          else pcmPlayer?.setServerRate(OUTPUT_RATE);
+          if (msg?.sample_rate_hz) {
+            console.log("[AUDIO] server sample rate from event:", msg.sample_rate_hz);
+            currentOutRate = msg.sample_rate_hz;
+            pcmPlayer?.setServerRate(currentOutRate);
+          } else {
+            pcmPlayer?.setServerRate(currentOutRate);
+          }
           return;
         }
 
@@ -876,7 +857,6 @@ document.addEventListener("DOMContentLoaded", () => {
     controls?.update();
     const t = clock.getElapsedTime();
 
-    // distortion drive: lowband + speech kick envelope
     let level = 0;
     if (analyser && freqData) {
       analyser.getByteFrequencyData(freqData);
@@ -885,15 +865,13 @@ document.addEventListener("DOMContentLoaded", () => {
       drawCircular(); updateRing();
     }
 
-    // decay kick quickly
     kick = Math.max(0.0, kick - 0.06);
 
-    // Local VAD handling: commit & kicks
     if (micActive) {
       const change = vadTick();
       if (change === "start") {
         hardStopAssistantAudio();
-        triggerKick(); // visual glitch pulse
+        triggerKick();
         const now = performance.now();
         if (now - lastVADEmit > 120) { disturbOrb(); lastVADEmit = now; }
         silenceFrames = 0;
@@ -905,7 +883,6 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    // also pump distortion with lowband energy
     const low = getLowbandLevel();
     const drive = THREE.MathUtils.clamp(level * 1.2 + low * 0.8, 0, 1.5);
 
@@ -919,9 +896,9 @@ document.addEventListener("DOMContentLoaded", () => {
     renderer.render(scene, camera);
   }
 
-  /* ------------ BOOT ------------ */
+  /* ------------ BOOT & MIC ACTIVATION ------------ */
   initAudio(); initThree(); initDOMParticles();
-  notify("SYSTEM ONLINE • TAP THE ORB TO ENABLE MIC", "ok", 2800);
+  notify("SYSTEM ONLINE • TAP ANYWHERE TO ENABLE MIC", "ok", 2800);
 
   async function enableMicAndRealtime() {
     try {
@@ -941,26 +918,18 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-// Activate mic on any user gesture (mouse/touch/pen/keyboard)
-let micArmed = false;
-
-const armMic = async (ev) => {
-  if (micArmed) return;
-  micArmed = true;
-  ev?.preventDefault?.();   // helps iOS treat it as a real gesture
-  await enableMicAndRealtime();
-};
-
-// Pointer covers mouse, touch, pen on modern browsers
-window.addEventListener("pointerdown", armMic, { once: true, passive: false });
-
-// Fallbacks for older mobile/Safari
-window.addEventListener("touchend", armMic, { once: true, passive: false });
-window.addEventListener("click", armMic, { once: true });
-
-// Optional: keyboard access (Space/Enter)
-window.addEventListener("keydown", (e) => {
-  if (!micArmed && (e.key === " " || e.key === "Enter")) armMic(e);
-}, { once: true });
-
+  // Activate mic on any user gesture (mouse/touch/pen/keyboard)
+  let micArmed = false;
+  const armMic = async (ev) => {
+    if (micArmed) return;
+    micArmed = true;
+    ev?.preventDefault?.();
+    await enableMicAndRealtime();
+  };
+  window.addEventListener("pointerdown", armMic, { once: true, passive: false });
+  window.addEventListener("touchend", armMic, { once: true, passive: false });
+  window.addEventListener("click", armMic, { once: true });
+  window.addEventListener("keydown", (e) => {
+    if (!micArmed && (e.key === " " || e.key === "Enter")) armMic(e);
+  }, { once: true });
 });
