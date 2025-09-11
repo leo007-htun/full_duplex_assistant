@@ -7,10 +7,10 @@
          src="https://img.shields.io/badge/%F0%9F%8E%99%EF%B8%8F%20Live%20Demo-com--cloud.cloud-orange?style=for-the-badge">
   </a>
 </h1>
-
+[![Watch the demo](https://img.youtube.com/vi/ioz0FZOchUY/maxresdefault.jpg)](https://youtu.be/ioz0FZOchUY)
 <!-- Demo video (centered) -->
 <p align="center">
-[![Watch the demo](https://img.youtube.com/vi/ioz0FZOchUY/maxresdefault.jpg)](https://youtu.be/ioz0FZOchUY)
+
 
 </p>
 
