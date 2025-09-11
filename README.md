@@ -119,15 +119,15 @@ Create `src/assistant/.env` with your secrets:
 
 #### 🎙️ Using the Assistant
 
-  Open https://com-cloud.cloud
-  
-  Click on ORB to Connect to establish WebSocket session.
-  
-  Speak naturally; interrupt the assistant mid-sentence.
-  
-  Watch live captions, hear real-time TTS playback.
-  
-  DONT FOTGET TO CLOSE THE TAB!!!
+    Open https://com-cloud.cloud
+    
+    Click on ORB to Connect to establish WebSocket session.
+    
+    Speak naturally; interrupt the assistant mid-sentence.
+    
+    Watch live captions, hear real-time TTS playback.
+    
+    DONT FOTGET TO CLOSE THE TAB!!!
 
 #### ⚙️ Configuration
 
