@@ -440,7 +440,9 @@ document.addEventListener("DOMContentLoaded", () => {
     ? "http://127.0.0.1:8000" : "";
 
   // IMPORTANT: in prod Traefik strips /api → FastAPI /rt-token
-  const TOKEN_ENDPOINT = `${API_BASE}/api/rt-token`.replace("//api", "/api");
+  //const TOKEN_ENDPOINT = `${API_BASE}/api/rt-token`.replace("//api", "/api");
+  const TOKEN_ENDPOINT = "/api/rt-token";
+
 
   const transcriptEl = document.getElementById("transcript-stream");
   let ws = null, wsOpen = false;
