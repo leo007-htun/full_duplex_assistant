@@ -1,0 +1,21 @@
+name: Release JS (GitHub Packages)
+on:
+  push:
+    tags: ['js-v*']       # e.g. js-v0.1.0
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@leo007-htun'
+      - run: npm ci || npm i
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
