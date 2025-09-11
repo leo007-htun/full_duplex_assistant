@@ -1,6 +1,6 @@
 {
   "name": "@leo007-htun/full-duplex-assistant-js",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "Client SDK for the full-duplex assistant (WebSocket helpers)",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/leo007-htun/full_duplex_assistant.git" },
