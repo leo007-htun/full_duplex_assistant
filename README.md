@@ -131,66 +131,66 @@ Create `src/assistant/.env` with your secrets:
 
 #### ⚙️ Configuration
 
-Key options:
-
-ASR: model, language hints, VAD sensitivity.
-
-TTS: voice, speed, sample rate.
-
-LLM: model, temperature, tool schemas.
-
-Traefik: TLS challenge type, timeouts, rate limits.
+    Key options:
+    
+    ASR: model, language hints, VAD sensitivity.
+    
+    TTS: voice, speed, sample rate.
+    
+    LLM: model, temperature, tool schemas.
+    
+    Traefik: TLS challenge type, timeouts, rate limits.
 
 #### 🔌 API
 
-GET /healthz – service health
-
-WS /ws/asr – audio in ↔ transcript out
-
-WS /ws/assistant – dialog orchestration (events + responses)
-
-WS /ws/tts – text in ↔ audio out
-
-POST /api/tools/<name> – trigger server-side tool functions
+    GET /healthz – service health
+    
+    WS /ws/asr – audio in ↔ transcript out
+    
+    WS /ws/assistant – dialog orchestration (events + responses)
+    
+    WS /ws/tts – text in ↔ audio out
+    
+    POST /api/tools/<name> – trigger server-side tool functions
 
 #### 🔐 Security
 
-HTTPS enforced (TLS via Let’s Encrypt + Traefik).
-
-Strict CORS (limited to https://com-cloud.cloud).
-
-API rate limiting enabled (/api).
-
-Secrets kept in .env (not in frontend).
+    HTTPS enforced (TLS via Let’s Encrypt + Traefik).
+    
+    Strict CORS (limited to https://com-cloud.cloud).
+    
+    API rate limiting enabled (/api).
+    
+    Secrets kept in .env (not in frontend).
 
 #### 📦 Deployment Notes
 
-Reverse proxy: Traefik v3 with ACME TLS challenge.
-
-Certificates stored in ./letsencrypt/acme.json.
-
-Static frontend served by Nginx (web service).
-
-Backend served via assistant (FastAPI) behind Traefik.
-
-Scale with Docker Swarm / k8s if needed.
+    Reverse proxy: Traefik v3 with ACME TLS challenge.
+    
+    Certificates stored in ./letsencrypt/acme.json.
+    
+    Static frontend served by Nginx (web service).
+    
+    Backend served via assistant (FastAPI) behind Traefik.
+    
+    Scale with Docker Swarm / k8s if needed.
 
 #### 🗺️ Roadmap
 
- Wake-word hotword detection
-
- Speaker diarization
-
- Plug-and-play tool registry
-
- Persistent transcripts
-
- Multi-voice TTS
+     Wake-word hotword detection
+    
+     Speaker diarization
+    
+     Plug-and-play tool registry
+    
+     Persistent transcripts
+    
+     Multi-voice TTS
 
 #### 🤝 Contributing
 
-Fork this repo
-
-Create a feature branch
-
-Submit PR with screenshots/logs if UI/backend affected
+    Fork this repo
+    
+    Create a feature branch
+    
+    Submit PR with screenshots/logs if UI/backend affected
