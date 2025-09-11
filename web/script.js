@@ -79,17 +79,17 @@ document.addEventListener("DOMContentLoaded", () => {
   let audioData = null, freqData = null;
   let micSource = null, micActive = false;
 
-  let audioSensitivity = 5.0, audioReactivity = 1.0;
+  let audioSensitivity = 0.9, audioReactivity = 1.0;
 
   const vadState = {
     speaking: false,
     noiseFloor: 0.015,
-    speakHold: 0,
+    speakHold: 1.0,
     silenceHold: 0,
     attackFrames: 3,
-    releaseFrames: 12,
-    thresholdRatio: 3.0,
-    zcrWeight: 0.6
+    releaseFrames: 100, // ~1s at ~60fps
+    thresholdRatio: 8.0,
+    zcrWeight: 0.4
   };
 
   function initAudio() {
@@ -521,61 +521,202 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   /* ===========================
-     REALTIME (ASR) + TTS
+     REALTIME (ASR + streamed TTS)
   ============================ */
 
-  // Where to reach the API in dev/prod
+  // Safer base detection (localhost / file:// dev)
   const API_BASE = (() => {
-    const isLocal = location.hostname === "localhost" || location.hostname === "127.0.0.1";
-    if (isLocal && location.port === "5500") return "http://127.0.0.1:8000"; // dev: live-server -> uvicorn
-    return ""; // prod: same-origin behind Traefik
+    const isLocalHost =
+      location.hostname === "localhost" ||
+      location.hostname === "127.0.0.1" ||
+      location.hostname === "::1" ||
+      location.protocol === "file:";
+    if (isLocalHost) return "http://127.0.0.1:8000";
+    return ""; // same-origin in prod
   })();
 
-  const TOKEN_ENDPOINT = API_BASE ? `${API_BASE}/rt-token` : `/api/rt-token`;
-  const TTS_BASE      = API_BASE ? `${API_BASE}/api/tts/stream` : `/api/tts/stream`;
+  // Token endpoint (your server returns ephemeral token)
+  const TOKEN_ENDPOINT = `${API_BASE}/rt-token`;
 
   const transcriptEl = document.getElementById("transcript-stream");
 
-  // Realtime WS
+  // WebSocket + mic buffering
   let ws = null;
   let wsOpen = false;
 
-  // Mic capture node
   let captureNode = null;
   let appendedMsSinceCommit = 0;
   let everAppended = false;
   let lastCommitAt = 0;
 
-  // TTS player (single <audio>)
-  const TTS_VOICE = "coral";
-  const TTS_FMT   = "wav"; // wav/pcm best latency
-  const ttsAudio  = new Audio();
-  ttsAudio.autoplay = true;
-  ttsAudio.preload  = "none";
-  ttsAudio.addEventListener("error", () => {
-    // Silently ignore; can surface if you want:
-    // notify("TTS ERROR", "error", 1500);
-  });
-
-  function stopSpeak(silent=false){
-    try {
-      ttsAudio.pause();
-      // Kill network stream immediately by clearing src
-      ttsAudio.src = "";
-      ttsAudio.load();
-      if (!silent) notify("TTS INTERRUPTED", "warn", 900);
-    } catch {}
+  // ---- Assistant captions (text) ----
+  function appendAssistantText(delta){
+    if (!delta) return;
+    let frag = transcriptEl.querySelector(".assistant.frag");
+    if (!frag) {
+      frag = document.createElement("span");
+      frag.className = "assistant frag";
+      transcriptEl.appendChild(frag);
+    }
+    frag.textContent += delta;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+  function endAssistantCaption(){
+    const frag = transcriptEl.querySelector(".assistant.frag");
+    if (!frag) return;
+    const line = document.createElement("div");
+    line.className = "final assistant";
+    line.textContent = frag.textContent.trim();
+    frag.remove();
+    if (line.textContent) transcriptEl.appendChild(line);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
-  function speak(text){
-    if (!text) return;
-    stopSpeak(true);
-    const url = `${TTS_BASE}?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(TTS_VOICE)}&fmt=${encodeURIComponent(TTS_FMT)}`;
-    ttsAudio.src = url;
-    ttsAudio.play().catch(()=>{});
+  // ---- User transcript UI ----
+  function appendTranscript(deltaText) {
+    if (!deltaText) return;
+    let frag = transcriptEl.querySelector(".frag.user");
+    if (!frag) {
+      frag = document.createElement("span");
+      frag.className = "frag user";
+      transcriptEl.appendChild(frag);
+    }
+    frag.textContent += deltaText;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+  async function finalizeTranscript(fullText) {
+    const frag = transcriptEl.querySelector(".frag.user");
+    const line = document.createElement("div");
+    line.className = "final user";
+    line.textContent = (fullText || (frag ? frag.textContent : "") || "").trim();
+    if (frag) frag.remove();
+    if (line.textContent) transcriptEl.appendChild(line);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
-  // helpers: downsample 48k→16k + PCM16 + base64
+  /* ---------- PCM Player (interruptible + resampling) ---------- */
+  class PCMPlayer {
+    constructor() {
+      // Browsers often force 48000 regardless of what you ask for
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.sampleRate = this.ctx.sampleRate; // actual device rate (often 48000)
+      this.serverRate = this.sampleRate;     // will be updated from config/events
+      this.node = null;
+      this.started = false;
+      this.activeGen = 0; // gate for late chunks
+    }
+    async init() {
+      if (this.node) return;
+      const workletCode = `
+        class PCMFeeder extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.buffers = [];
+            this.readIndex = 0;
+            this.cur = null;
+            this.port.onmessage = e => {
+              const d = e.data || {};
+              if (d.type === 'push') {
+                this.buffers.push(new Float32Array(d.payload));
+              } else if (d.type === 'clear') {
+                this.buffers.length = 0;
+                this.cur = null;
+                this.readIndex = 0;
+              }
+            };
+          }
+          process(_inputs, outputs) {
+            const out = outputs[0][0];
+            let i = 0;
+            while (i < out.length) {
+              if (!this.cur || this.readIndex >= this.cur.length) {
+                this.cur = this.buffers.shift();
+                this.readIndex = 0;
+                if (!this.cur) {
+                  while (i < out.length) out[i++] = 0;
+                  return true;
+                }
+              }
+              const take = Math.min(out.length - i, this.cur.length - this.readIndex);
+              out.set(this.cur.subarray(this.readIndex, this.readIndex + take), i);
+              i += take;
+              this.readIndex += take;
+            }
+            return true;
+          }
+        }
+        registerProcessor('pcm-feeder', PCMFeeder);
+      `;
+      const blob = new Blob([workletCode], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      await this.ctx.audioWorklet.addModule(url);
+      this.node = new AudioWorkletNode(this.ctx, 'pcm-feeder');
+      this.node.connect(this.ctx.destination);
+    }
+    async start() {
+      await this.init();
+      if (this.ctx.state === "suspended") await this.ctx.resume();
+      this.started = true;
+    }
+    clear() {
+      if (!this.node) return;
+      this.node.port.postMessage({ type: 'clear' });
+    }
+    setGeneration(gen) {
+      this.activeGen = gen;
+    }
+    setServerRate(hz) {
+      this.serverRate = hz || this.sampleRate;
+    }
+    static resampleLinear(f32, from, to) {
+      if (!f32 || from === to) return f32;
+      const len = Math.max(1, Math.round(f32.length * to / from));
+      const out = new Float32Array(len);
+      const ratio = (f32.length - 1) / (len - 1);
+      for (let i = 0; i < len; i++) {
+        const x = i * ratio;
+        const i0 = Math.floor(x);
+        const i1 = Math.min(f32.length - 1, i0 + 1);
+        const t = x - i0;
+        out[i] = f32[i0] * (1 - t) + f32[i1] * t;
+      }
+      return out;
+    }
+    enqueueBase64PCM16(b64, gen) {
+      if (!this.started || !b64) return;
+      if (gen !== this.activeGen) return;
+
+      const raw = atob(b64);
+      const len = raw.length;
+      const buf = new ArrayBuffer(len);
+      const view = new Uint8Array(buf);
+      for (let i = 0; i < len; i++) view[i] = raw.charCodeAt(i);
+      const i16 = new Int16Array(buf);
+      let f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = Math.max(-1, Math.min(1, i16[i] / 32768));
+
+      if (this.serverRate !== this.sampleRate) {
+        f32 = PCMPlayer.resampleLinear(f32, this.serverRate, this.sampleRate);
+      }
+      this.node.port.postMessage({ type: 'push', payload: f32.buffer }, [f32.buffer]);
+    }
+  }
+  let pcmPlayer = null;
+
+  // generation for dropping stale audio/text
+  let responseGen = 0;
+  let activeGen = 0;
+  function bumpGeneration() {
+    activeGen = ++responseGen;
+    if (pcmPlayer) pcmPlayer.setGeneration(activeGen);
+  }
+  function hardStopAssistantAudio(reason="barge-in") {
+    try { if (wsOpen) ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+    if (pcmPlayer) pcmPlayer.clear();
+    notify("TTS INTERRUPTED", "warn", 900);
+  }
+
+  // ---- helpers: resample + PCM16 + base64 for mic → WS ----
   function downsampleTo16k(buffer, inRate) {
     const outRate = 16000;
     if (inRate === outRate) return buffer;
@@ -612,92 +753,100 @@ document.addEventListener("DOMContentLoaded", () => {
     return btoa(bin);
   }
 
-  // transcript UI
-  function appendTranscript(deltaText) {
-    if (!deltaText) return;
-    let frag = transcriptEl.querySelector(".frag");
-    if (!frag) {
-      frag = document.createElement("span");
-      frag.className = "frag";
-      transcriptEl.appendChild(frag);
-    }
-    frag.textContent += deltaText;
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
-  }
-  function finalizeTranscript(fullText) {
-    const frag = transcriptEl.querySelector(".frag");
-    const line = document.createElement("div");
-    line.className = "final";
-    line.textContent = (fullText || (frag ? frag.textContent : "") || "").trim();
-    if (frag) frag.remove();
-    if (line.textContent) transcriptEl.appendChild(line);
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
-
-    // 🔊 Auto-speak the final text (you can replace with assistant reply later)
-    if (line.textContent) speak(line.textContent);
-  }
-
+  // --------- Realtime start ---------
   async function startRealtime(userMediaStream) {
     try {
       // 1) fetch ephemeral token
       const r = await fetch(TOKEN_ENDPOINT, { cache: "no-store" });
-      if (!r.ok) { notify("AUTH HTTP ERROR", "error", 4000); return; }
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        notify(`AUTH HTTP ERROR (${r.status})`, "error", 5000);
+        console.error("rt-token error:", r.status, body);
+        return;
+      }
       const tok = await r.json();
       const token = tok?.client_secret?.value || tok?.client_secret || tok?.value;
-      if (!token) { notify("AUTH MISSING TOKEN", "error", 4000); return; }
+      if (!token) {
+        notify("AUTH MISSING TOKEN", "error", 5000);
+        console.error("rt-token response:", tok);
+        return;
+      }
 
-      // 2) connect WS
-      const url = "wss://api.openai.com/v1/realtime?intent=transcription";
-      ws = new WebSocket(url, [
-        "realtime",
-        `openai-insecure-api-key.${token}`,
-        "openai-beta.realtime-v1"
-      ]);
+      // 2) connect WS to Realtime
+      const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+      const tryOpen = (protocols) =>
+        new Promise((resolve, reject) => {
+          const sock = new WebSocket(url, protocols);
+          let opened = false;
+          sock.onopen = () => { opened = true; resolve(sock); };
+          sock.onerror = (e) => { if (!opened) reject(e); };
+          sock.onclose = (ev) => {
+            if (!opened) reject(new Error(`WS close before open. code=${ev.code} reason=${ev.reason || "(no reason)"}`));
+          };
+        });
 
-      ws.onopen = () => {
-        wsOpen = true;
-        everAppended = false;
-        appendedMsSinceCommit = 0;
-        lastCommitAt = performance.now();
-        notify("REALTIME LINK ESTABLISHED", "ok", 1800);
+      const protoA = ["realtime", "openai-beta.realtime-v1", `openai-insecure-api-key.${token}`];
+      const protoB = ["realtime", `openai-insecure-api-key.${token}`, "openai-beta.realtime-v1"];
 
-        // Session config (server VAD + model)
-        ws.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            input_audio_format: "pcm16",
-            input_audio_transcription: {
-              model: "gpt-4o-mini-transcribe"
-              // language: "en"
-            },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500
-            },
-            input_audio_noise_reduction: { type: "near_field" }
-          }
-        }));
+      let sock;
+      try {
+        sock = await tryOpen(protoA);
+      } catch (e1) {
+        console.warn("WS open failed (A). Retrying with alt protocol order…", e1);
+        sock = await tryOpen(protoB);
+      }
 
-        // begin mic streaming
-        startMicPCMStream(userMediaStream);
-      };
+      ws = sock;
+      wsOpen = true;
+      everAppended = false;
+      appendedMsSinceCommit = 0;
+      lastCommitAt = performance.now();
+      notify("REALTIME LINK ESTABLISHED", "ok", 1800);
 
+      // pick output sample-rate to match the actual device rate
+      const desiredOutRate = 24000;
+        (pcmPlayer && pcmPlayer.sampleRate) ? pcmPlayer.sampleRate : 24000;
+      if (pcmPlayer) pcmPlayer.setServerRate(desiredOutRate);
+
+      // 3) session config (ASR + audio out)
+      ws.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          // mic input (we send 16k PCM)
+          input_audio_format: "pcm16",
+          input_audio_sample_rate_hz: 16000,
+          input_audio_channels: 1,
+          input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
+          input_audio_noise_reduction: { type: "near_field" },
+
+          // assistant audio out
+          output_audio_format: "pcm16",
+          output_audio_sample_rate_hz: desiredOutRate,
+          voice: "alloy", // try "alloy" if you want brighter
+
+          // end-of-turn detection
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.1,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 1000
+          },
+
+          // tone
+          instructions: "You are Jarvis. Be concise, helpful, and speak in short, friendly, energetic sentences."
+        }
+      }));
+
+      // 4) begin mic streaming
+      startMicPCMStream(userMediaStream);
+
+      // 5) message handling
       ws.onmessage = (ev) => {
-        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
         const t = msg.type;
 
-        // 🔇 If server VAD hears new speech → hard barge-in TTS
-        if (t === "input_audio_buffer.speech_started") {
-          stopSpeak(true);
-        }
-
-        if (t === "input_audio_buffer.committed") {
-          appendedMsSinceCommit = 0;
-        }
-
-        // Newer events
+        // Live ASR text
         if (t === "conversation.item.input_audio_transcription.delta") {
           appendTranscript(msg.delta || "");
           return;
@@ -707,22 +856,61 @@ document.addEventListener("DOMContentLoaded", () => {
           return;
         }
 
-        // Back-compat events
-        if (t === "transcript.text.delta" || t === "response.output_text.delta" || t === "response.transcript.delta") {
-          appendTranscript(msg.delta || msg.text || msg.value || "");
-          return;
-        }
-        if (t === "transcript.text.done" || t === "response.output_text.done" || t === "response.transcript.done") {
-          finalizeTranscript(msg.text || msg.value || "");
+        // When speech stops, request a response (text + audio)
+        if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
+          ws.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["text","audio"],
+              audio: { format: "pcm16", sample_rate_hz: desiredOutRate, voice: "verse" }
+            }
+          }));
           return;
         }
 
-        if (t === "transcription.speech_stopped") {
-          // Encourage the server to finalize if it hasn't already
-          maybeCommitToServer(true);
+        // New response lifecycle
+        if (t === "response.created") {
+          bumpGeneration();           // new gen for this response
+          if (pcmPlayer) pcmPlayer.clear(); // clear residual audio
+          return;
+        }
+
+        // If API surfaces the actual sample rate, capture it
+        if (t === "response.output_audio.start" || t === "response.audio.start") {
+          if (msg?.sample_rate_hz && pcmPlayer) {
+            pcmPlayer.setServerRate(msg.sample_rate_hz);
+          }
+          return;
+        }
+
+        // Assistant text deltas for captions
+        if (t === "response.output_text.delta" || t === "response.transcript.delta") {
+          appendAssistantText(msg.delta || msg.text || msg.value || "");
+          return;
+        }
+        if (t === "response.completed" || t === "response.output_text.done") {
+          endAssistantCaption();
+          return;
+        }
+
+        // Assistant audio deltas (base64 PCM16)
+        if (t === "response.output_audio.delta" || t === "response.audio.delta") {
+          const b64 = msg.delta || msg.audio;
+          if (b64 && pcmPlayer) pcmPlayer.enqueueBase64PCM16(b64, activeGen);
+          return;
+        }
+        if (t === "response.output_audio.done") {
+          return;
+        }
+
+        // Barge-in: user starts talking → cancel assistant
+        if (t === "input_audio_buffer.speech_started") {
+          hardStopAssistantAudio("server-vad");
+          return;
         }
 
         if (t === "error") {
+          console.error("Realtime error:", msg);
           notify(`REALTIME ERROR: ${msg.error?.message || "unknown"}`, "error", 5000);
         }
       };
@@ -732,18 +920,22 @@ document.addEventListener("DOMContentLoaded", () => {
         everAppended = false;
         appendedMsSinceCommit = 0;
         stopMicPCMStream();
+        const reason = ev.reason || "(no reason)";
         if ([1008, 4401, 4403].includes(ev.code)) {
-          notify("REAL TIME AUTH FAILED", "error", 5000);
+          notify(`REALTIME AUTH FAILED (${ev.code})`, "error", 6000);
         } else {
-          notify(`REALTIME CLOSED (${ev.code})`, "warn", 2500);
+          notify(`REALTIME CLOSED (${ev.code})`, "warn", 3000);
         }
+        console.warn("WS closed:", ev.code, reason);
       };
 
-      ws.onerror = () => notify("REALTIME SOCKET ERROR", "error", 4000);
-
+      ws.onerror = (e) => {
+        console.error("WS onerror:", e);
+        notify("REALTIME SOCKET ERROR", "error", 4000);
+      };
     } catch (e) {
-      console.error(e);
-      notify("REALTIME INIT FAILED", "error", 4000);
+      console.error("startRealtime fatal:", e);
+      notify("REALTIME INIT FAILED", "error", 6000);
     }
   }
 
@@ -757,8 +949,8 @@ document.addEventListener("DOMContentLoaded", () => {
     captureNode.connect(sink); sink.connect(audioContext.destination);
     inputNode.connect(captureNode);
 
-    const inRate = audioContext.sampleRate;            // ~48000
-    const frameMs = 220;                               // ≥100ms per append
+    const inRate = audioContext.sampleRate;           // ~48000
+    const frameMs = 220;                              // ≥100ms per append
     const samplesPerFrame = Math.floor(inRate * (frameMs / 1000));
 
     let acc = new Float32Array(0);
@@ -795,7 +987,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Ask server to finalize after silence / throttle commits
+  // Encourage server finalize after local silence / throttle commits
   function maybeCommitToServer(force = false) {
     if (!wsOpen || !ws || ws.readyState !== 1) return;
     if (!everAppended) return;
@@ -805,7 +997,6 @@ document.addEventListener("DOMContentLoaded", () => {
       if (appendedMsSinceCommit < 120) return;
       if (now - lastCommitAt < 300) return;
     }
-
     try {
       ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       lastCommitAt = now;
@@ -831,12 +1022,11 @@ document.addEventListener("DOMContentLoaded", () => {
       drawCircular(); updateRing();
     }
 
-    // 🔇 Local VAD barge-in / finalize
+    // Local VAD barge-in / finalize
     if (micActive) {
       const change = vadTick();
       if (change === "start") {
-        // user started talking: kill TTS immediately
-        stopSpeak(true);
+        hardStopAssistantAudio("local-vad");
         const now = performance.now();
         if (now - lastVADEmit > 120) {
           disturbOrb();
@@ -846,9 +1036,8 @@ document.addEventListener("DOMContentLoaded", () => {
       } else if (vadState.speaking) {
         silenceFrames = 0;
       } else {
-        // when locally silent for ~500ms, encourage finalization
         silenceFrames++;
-        if (silenceFrames > 30) { // ~30 frames @60fps ≈ 500ms
+        if (silenceFrames > 30) { // ~500ms @60fps
           maybeCommitToServer();
           silenceFrames = 0;
         }
@@ -889,11 +1078,16 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       if (audioContext.state === "suspended") await audioContext.resume();
 
+      // init realtime audio player
+      if (!pcmPlayer) {
+        pcmPlayer = new PCMPlayer();
+        await pcmPlayer.start(); // must be after user gesture
+      }
+
       micSource = audioContext.createMediaStreamSource(stream);
       if (analyser) micSource.connect(analyser);
       micActive = true;
 
-      // kick off realtime
       startRealtime(stream);
 
       notify("MIC CONNECTED • REALTIME ON", "ok", 1600);
@@ -902,54 +1096,33 @@ document.addEventListener("DOMContentLoaded", () => {
       notify("MIC PERMISSION DENIED", "error", 4000);
     }
   }
-  /* === Start mic/realtime on first user gesture (works on phone & desktop) === */
-  function setupUserGestureStart(options = {}) {
-    const target =
-      options.target ||
-      document.getElementById("three-container") ||
-      window; // orb area if present, else whole window
-    const allowKeyboard = options.allowKeyboard ?? true;
 
-    let started = false;
+  // One-time mic + realtime enable on first user gesture (mobile-friendly)
+function handleFirstGesture(e) {
+  // 1) Unlock / create AudioContext synchronously in the gesture stack
+  if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioContext.state === "suspended") audioContext.resume();
 
-    const start = async () => {
-      if (started) return;
-      started = true;
-      try {
-        // iOS: resume AudioContext during the gesture
-        if (typeof audioContext !== "undefined" && audioContext && audioContext.state === "suspended") {
-          try { await audioContext.resume(); } catch {}
-        }
-        await enableMicAndRealtime();
-      } catch (err) {
-        // If user denied mic or something failed, let them try again
-        started = false;
-        attach();
-        console.error("[gesture start] failed:", err);
-      }
-    };
-
-    const keyStart = (e) => {
-      if (!allowKeyboard) return;
-      if (e.key === "Enter" || e.key === " ") start();
-    };
-
-    const attach = () => {
-      const oncePassive = { once: true, passive: true };
-      // Pointer = mouse + touch on modern browsers
-      target.addEventListener("pointerdown", start, oncePassive);
-      // Extra safety for older iOS WebKit quirks
-      target.addEventListener("touchend", start, oncePassive);
-      // Keyboard accessibility
-      window.addEventListener("keydown", keyStart, { once: true });
-    };
-
-    attach();
+  // 2) Start the PCM player (also needs a gesture on iOS)
+  if (!pcmPlayer) {
+    pcmPlayer = new PCMPlayer(/* your desiredRate, e.g. 16000 or 24000 */);
+    // don't await here—just kick it off in the same gesture task
+    pcmPlayer.start();
   }
 
-  // 🔧 Call it after enableMicAndRealtime() is defined:
-  setupUserGestureStart(); 
-  // (Optional) to require tapping the orb area specifically:
-  // setupUserGestureStart({ target: document.getElementById("three-container") });
+  // 3) Now request mic and open realtime
+  enableMicAndRealtime();
+}
+
+// Use pointerdown for touch/mouse/pen, plus a11y keyboard fallback
+const onceOpts = { once: true, passive: true };
+window.addEventListener("pointerdown", handleFirstGesture, onceOpts);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") handleFirstGesture(e);
+}, onceOpts);
+
+// (Optional) keep a click fallback for ancient browsers
+window.addEventListener("click", handleFirstGesture, { once: true });
+
 
 });
