@@ -28,7 +28,7 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
 
 ## 🧭 Architecture
 
-### Application Flow
+##### Application Flow
 
     Browser (Web UI)
     ├─ Mic capture (WebAudio) → WebSocket → Assistant (FastAPI)
