@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "full-duplex-assistant"         # must be unique on PyPI; change if taken
-version = "0.1.0"
+version = "0.1.1"
 description = "Real-time full-duplex voice assistant (FastAPI backend)"
 readme = "README.md"
 license = { file = "LICENSE" }
