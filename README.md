@@ -103,9 +103,9 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
     LOG_LEVEL=info
 
 
-#### 🖥️ Local Development
+#### 3. 🖥️ Local Development
 
-###### Run backend directly:
+##### Run backend directly:
 
     cd src/assistant
     python -m venv .venv && source .venv/bin/activate
