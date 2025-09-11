@@ -21,19 +21,20 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
 ---
 
 ## 🧭 Architecture (at a glance)
-Browser (Web UI)
-├─ Mic capture (WebAudio) → WebSocket → ASR Ingress
-│ │
-│ partial transcripts
-│ ▼
-├─ Live captions ← ASR (streaming)
-│ │
-│ ▼
-├─ TTS audio playback ← TTS (streaming chunks)
-│ ▲
-│ │
-└─ Controls/Events → Orchestrator (LLM, tools, memory)
-│
+
+    Browser (Web UI)
+    ├─ Mic capture (WebAudio) → WebSocket → ASR Ingress
+    │ │
+    │ partial transcripts
+    │ ▼
+    ├─ Live captions ← ASR (streaming)
+    │ │
+    │ ▼
+    ├─ TTS audio playback ← TTS (streaming chunks)
+    │ ▲
+    │ │
+    └─ Controls/Events → Orchestrator (LLM, tools, memory)
+    │
 
 
 Typical services:
