@@ -1,19 +1,39 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <title>JARVIS Orb — VAD Reactive</title>
+
+  <!-- Mobile & PWA-friendly -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#05070e" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <!-- Optional: your web app manifest -->
+  <!-- <link rel="manifest" href="/manifest.webmanifest"> -->
+
+  <!-- Icons (optional but recommended) -->
+  <!-- <link rel="apple-touch-icon" href="/icons/icon-192.png"> -->
+  <!-- <link rel="icon" sizes="192x192" href="/icons/icon-192.png"> -->
+
   <link href="https://fonts.cdnfonts.com/css/thegoodmonolith" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js" defer></script>
 </head>
 <body>
-  <noscript>
-    This app needs JavaScript enabled for the reactive orb and transcript.
-  </noscript>
+  <noscript>This app needs JavaScript enabled for the reactive orb and transcript.</noscript>
+
+  <!-- Mobile gesture helper (tappable overlay to unlock audio on iOS/Android).
+       Your JS already listens for pointerdown on window, so tapping this works too.
+       Hide it with CSS on desktop, or programmatically after init. -->
+  <button id="start-voice"
+          class="start-voice"
+          aria-label="Start voice assistant"
+          aria-live="polite">
+    Tap to Start
+  </button>
 
   <!-- Space bg -->
   <div class="space-background" aria-hidden="true"></div>
@@ -28,8 +48,10 @@
     </div>
   </div>
 
-  <!-- HUD + grid -->
+  <!-- Notifications -->
   <div class="notification" id="notification" role="status" aria-live="polite">Initializing…</div>
+
+  <!-- 3D scene -->
   <div id="three-container" aria-label="3D reactive orb"></div>
   <div class="grid-overlay" aria-hidden="true"></div>
 
@@ -46,7 +68,7 @@
 
   <div class="floating-particles" id="floating-particles" aria-hidden="true"></div>
 
-  <!-- Minimal header -->
+  <!-- Header / HUD -->
   <div class="interface-container" aria-hidden="true">
     <header class="header">
       <div class="header-item">NEXUS.ORB/VAD</div>
@@ -59,24 +81,43 @@
     <div class="scanner-frame" role="img" aria-label="Voice activity detector frame">
       <div class="corner-tl"></div><div class="corner-tr"></div>
       <div class="corner-bl"></div><div class="corner-br"></div>
-      <div class="scanner-id">VOICE.ACTIVITY.DETECTOR</div>
-      <div class="scanner-id-right">ORB.DISTORT.RESPOND</div>
+      <div class="scanner-id">V.A.D/div>
+      <div class="scanner-id-right">O.D.R</div>
       <div class="scanner-line" aria-hidden="true"></div>
     </div>
   </div>
 
-  <!-- Transcript (responsive via your CSS: side panel on desktop, bottom sheet on mobile) -->
-  <aside id="transcript-panel" class="transcript-panel" aria-live="polite" aria-label="Live transcript">
-    <div class="transcript-title"> 🔴 LIVE TRANSCRIPT</div>
+  <!-- Transcript (bottom sheet on mobile, side panel on desktop via CSS) -->
+  <aside id="transcript-panel"
+         class="transcript-panel"
+         aria-live="polite"
+         aria-label="Live transcript">
+    <div class="transcript-title">🔴 LIVE TRANSCRIPT</div>
     <div id="transcript-stream" class="transcript-stream"></div>
   </aside>
 
-  <!-- Toggle for transcript panel (hook in your CSS/JS as desired) -->
-  <button class="transcript-toggle" id="transcript-toggle" aria-expanded="false" aria-controls="transcript-panel">
+  <!-- Toggle for transcript panel -->
+  <button class="transcript-toggle"
+          id="transcript-toggle"
+          aria-expanded="false"
+          aria-controls="transcript-panel">
     Transcript
   </button>
 
   <!-- App -->
   <script type="module" src="script.js"></script>
+  <script>
+    // Optional tiny helper: hide the start overlay after the first gesture
+    (function () {
+      const btn = document.getElementById('start-voice');
+      const hide = () => btn && (btn.style.display = 'none');
+      window.addEventListener('pointerdown', hide, { once: true, passive: true });
+      window.addEventListener('keydown', hide, { once: true });
+      // If you prefer clicking the button specifically:
+      btn?.addEventListener('pointerdown', () => {
+        // Your script.js already listens on window pointerdown; this ensures the same.
+      }, { once: true });
+    })();
+  </script>
 </body>
 </html>
