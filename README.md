@@ -82,7 +82,7 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
 
 ##### 2. Configure Environment
 
-Create `src/assistant/.env` with your secrets:
+    Create `src/assistant/.env` with your secrets:
 
     # LLM / Orchestrator
     LLM_PROVIDER=openai
@@ -103,7 +103,7 @@ Create `src/assistant/.env` with your secrets:
     LOG_LEVEL=info
 
 
-####🖥️ Local Development
+#### 🖥️ Local Development
 
 ###### Run backend directly:
 
