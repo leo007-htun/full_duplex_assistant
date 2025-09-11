@@ -43,3 +43,5 @@ Low-latency, interruptible, **full-duplex** (talk & listen at the same time) voi
     │ │
     └─ Controls/Events → LLM Orchestrator
 
+### 🐋 Docker Stack & Routing
+
