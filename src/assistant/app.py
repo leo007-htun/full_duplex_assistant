@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlparse
+from .api.responses import router as responses_router
+app.include_router(responses_router)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
