@@ -97,8 +97,8 @@ jobs:
               > src/assistant/.env
 
             # Write compose env
-            printf 'LE_EMAIL=%s\nIMAGE_TAG=%s\n' \
-              "${{ secrets.LE_EMAIL }}" "${{ needs.build_push.outputs.tag }}" \
+            printf 'LE_EMAIL=%s\nIMAGE_TAG=%s\nGRAFANA_PASSWORD=%s\n' \
+              "${{ secrets.LE_EMAIL }}" "${{ needs.build_push.outputs.tag }}" "${{ secrets.GRAFANA_PASSWORD }}" \
               > .env
 
             # Ensure ACME store
