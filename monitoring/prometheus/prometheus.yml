@@ -1,0 +1,58 @@
+# Prometheus Configuration for Full-Duplex Voice Assistant
+
+global:
+  scrape_interval: 15s  # Scrape metrics every 15 seconds
+  evaluation_interval: 15s  # Evaluate rules every 15 seconds
+  external_labels:
+    cluster: 'com-cloud-production'
+    service: 'full-duplex-assistant'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Load alerting rules
+rule_files:
+  - '/etc/prometheus/alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # FastAPI backend metrics
+  - job_name: 'assistant-backend'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'assistant:8000'  # Production: same Docker network
+          # - 'host.docker.internal:8000'  # Local dev: Docker on Mac/Windows
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
+
+  # Node exporter (system metrics)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets:
+          - 'node-exporter:9100'
+
+  # Traefik metrics (if exposed)
+  - job_name: 'traefik'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'host.docker.internal:8080'
+    scrape_interval: 30s
+
+  # Docker container metrics (if cAdvisor is running)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets:
+          - 'cadvisor:8080'
+    scrape_interval: 30s

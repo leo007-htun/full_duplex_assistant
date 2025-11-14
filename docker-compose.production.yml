@@ -1,0 +1,124 @@
+# Production Docker Compose with Full Monitoring Stack
+# This extends your existing docker-compose.yml with Prometheus + Grafana
+
+version: "3.9"
+
+services:
+  # Existing services are inherited from docker-compose.yml
+  # Add these monitoring services:
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.external-url=https://com-cloud.cloud/prometheus'
+      - '--web.route-prefix=/'
+    networks:
+      - web
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.prometheus.rule=Host(`com-cloud.cloud`) && PathPrefix(`/prometheus`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.routers.prometheus.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.prometheus.priority=90"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+      # Add basic auth for security (optional but recommended)
+      - "traefik.http.routers.prometheus.middlewares=prometheus-auth"
+      - "traefik.http.middlewares.prometheus-auth.basicauth.users=${PROMETHEUS_AUTH:-admin:$$apr1$$8eVXLq6I$$5sSl0zEhVlVqLVl9vYxLW0}"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://com-cloud.cloud/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    networks:
+      - web
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.grafana.rule=Host(`com-cloud.cloud`) && PathPrefix(`/grafana`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.grafana.priority=90"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  # Node exporter for system metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - web
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"  # Internal only
+
+  # AlertManager for alerts (optional)
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=https://com-cloud.cloud/alertmanager'
+      - '--web.route-prefix=/'
+    networks:
+      - web
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.alertmanager.rule=Host(`com-cloud.cloud`) && PathPrefix(`/alertmanager`)"
+      - "traefik.http.routers.alertmanager.entrypoints=websecure"
+      - "traefik.http.routers.alertmanager.tls=true"
+      - "traefik.http.routers.alertmanager.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.alertmanager.priority=90"
+      - "traefik.http.services.alertmanager.loadbalancer.server.port=9093"
+      - "traefik.http.routers.alertmanager.middlewares=alertmanager-auth"
+      - "traefik.http.middlewares.alertmanager-auth.basicauth.users=${PROMETHEUS_AUTH:-admin:$$apr1$$8eVXLq6I$$5sSl0zEhVlVqLVl9vYxLW0}"
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+
+networks:
+  web:
+    driver: bridge

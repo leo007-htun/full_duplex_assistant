@@ -1,0 +1,207 @@
+# Alert Rules for Full-Duplex Voice Assistant
+
+groups:
+  - name: latency_alerts
+    interval: 30s
+    rules:
+      # Critical: E2E latency too high
+      - alert: HighEndToEndLatency
+        expr: histogram_quantile(0.95, rate(e2e_latency_client_milliseconds_bucket[5m])) > 2000
+        for: 5m
+        labels:
+          severity: critical
+          component: latency
+        annotations:
+          summary: "High end-to-end latency detected"
+          description: "p95 E2E latency is {{ $value }}ms (threshold: 2000ms)"
+
+      # Warning: Token mint latency high
+      - alert: SlowTokenMinting
+        expr: histogram_quantile(0.95, rate(token_mint_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: token-mint
+        annotations:
+          summary: "Token minting is slow"
+          description: "p95 token mint latency is {{ $value }}s"
+
+      # Warning: Barge-in response slow
+      - alert: SlowBargeInResponse
+        expr: histogram_quantile(0.95, rate(barge_in_latency_milliseconds_bucket[5m])) > 500
+        for: 3m
+        labels:
+          severity: warning
+          component: barge-in
+        annotations:
+          summary: "Barge-in response time degraded"
+          description: "p95 barge-in latency is {{ $value }}ms"
+
+  - name: error_alerts
+    interval: 30s
+    rules:
+      # Critical: High error rate
+      - alert: HighErrorRate
+        expr: rate(http_errors_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: critical
+          component: http
+        annotations:
+          summary: "High HTTP error rate"
+          description: "Error rate is {{ $value }} errors/sec"
+
+      # Critical: Rate limiting triggered frequently
+      - alert: FrequentRateLimiting
+        expr: rate(rate_limit_exceeded_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: rate-limit
+        annotations:
+          summary: "Frequent rate limiting events"
+          description: "Rate limit exceeded {{ $value }} times/sec"
+
+      # Warning: WebSocket disconnections
+      - alert: HighWebSocketDisconnections
+        expr: rate(websocket_disconnections_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: websocket
+        annotations:
+          summary: "High WebSocket disconnection rate"
+          description: "{{ $value }} disconnections/sec"
+
+  - name: service_health
+    interval: 15s
+    rules:
+      # Critical: Service down
+      - alert: ServiceDown
+        expr: service_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: "Service is down"
+          description: "Full-duplex assistant service is not responding"
+
+      # Critical: Service unresponsive
+      - alert: ServiceUnresponsive
+        expr: up{job="assistant-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: "Backend service unreachable"
+          description: "Prometheus cannot scrape metrics from backend"
+
+  - name: resource_alerts
+    interval: 30s
+    rules:
+      # Critical: High CPU usage
+      - alert: HighCPUUsage
+        expr: system_cpu_percent > 90
+        for: 3m
+        labels:
+          severity: critical
+          component: resources
+        annotations:
+          summary: "CPU usage critically high"
+          description: "CPU usage is {{ $value }}%"
+
+      # Warning: High memory usage
+      - alert: HighMemoryUsage
+        expr: (system_memory_bytes{type="used"} / system_memory_bytes{type="total"}) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          component: resources
+        annotations:
+          summary: "Memory usage high"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      # Warning: Process memory growing
+      - alert: ProcessMemoryGrowth
+        expr: rate(process_memory_bytes{type="rss"}[10m]) > 10485760  # 10MB/10min
+        for: 10m
+        labels:
+          severity: warning
+          component: memory-leak
+        annotations:
+          summary: "Process memory continuously growing"
+          description: "Potential memory leak detected"
+
+  - name: streaming_quality
+    interval: 30s
+    rules:
+      # Warning: High packet loss
+      - alert: HighPacketLoss
+        expr: streaming_packet_loss_rate > 0.01  # 1% loss
+        for: 2m
+        labels:
+          severity: warning
+          component: streaming
+        annotations:
+          summary: "High packet loss detected"
+          description: "Packet loss rate is {{ $value | humanizePercentage }}"
+
+      # Warning: High jitter
+      - alert: HighJitter
+        expr: streaming_jitter_milliseconds > 50
+        for: 3m
+        labels:
+          severity: warning
+          component: streaming
+        annotations:
+          summary: "High network jitter"
+          description: "Jitter is {{ $value }}ms"
+
+      # Warning: Network quality degraded
+      - alert: NetworkQualityDegraded
+        expr: network_quality_index < 0.7
+        for: 5m
+        labels:
+          severity: warning
+          component: network
+        annotations:
+          summary: "Network quality degraded"
+          description: "Network Quality Index is {{ $value }}"
+
+      # Warning: Frequent underruns
+      - alert: FrequentAudioUnderruns
+        expr: rate(streaming_underrun_events_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+          component: audio
+        annotations:
+          summary: "Frequent audio buffer underruns"
+          description: "{{ $value }} underruns/sec detected"
+
+  - name: capacity_alerts
+    interval: 30s
+    rules:
+      # Warning: High concurrent connections
+      - alert: HighConcurrentConnections
+        expr: websocket_connections_active > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: capacity
+        annotations:
+          summary: "High number of concurrent connections"
+          description: "{{ $value }} active WebSocket connections"
+
+      # Info: Approaching capacity
+      - alert: ApproachingCapacity
+        expr: websocket_connections_active > 60
+        for: 10m
+        labels:
+          severity: info
+          component: capacity
+        annotations:
+          summary: "Approaching connection capacity"
+          description: "{{ $value }} active connections (threshold: 100)"
