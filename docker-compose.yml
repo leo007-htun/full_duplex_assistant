@@ -94,6 +94,14 @@ services:
       - "traefik.http.middlewares.api-ratelimit.ratelimit.burst=20"
       - "traefik.http.routers.api.middlewares=strip-api,api-ratelimit"
 
+      # ===== Metrics router: expose /metrics endpoint =====
+      - "traefik.http.routers.metrics.rule=Host(`com-cloud.cloud`) && Path(`/metrics`)"
+      - "traefik.http.routers.metrics.entrypoints=websecure"
+      - "traefik.http.routers.metrics.tls=true"
+      - "traefik.http.routers.metrics.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.metrics.priority=120"
+      - "traefik.http.routers.metrics.service=assistant"
+
       # ===== WebSocket router (optional if you expose /ws) =====
       - "traefik.http.routers.ws.rule=Host(`com-cloud.cloud`) && PathPrefix(`/ws`)"
       - "traefik.http.routers.ws.entrypoints=websecure"
