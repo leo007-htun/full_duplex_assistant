@@ -582,6 +582,19 @@ document.addEventListener("DOMContentLoaded", () => {
   let everAppended = false;
   let lastCommitAt = 0;
 
+  // ---- Transcript helpers ----
+  const MAX_TRANSCRIPT_LINES = 8; // Keep only last 8 exchanges (4 user + 4 assistant)
+
+  function pruneOldTranscripts() {
+    const finals = transcriptEl.querySelectorAll(".final");
+    if (finals.length > MAX_TRANSCRIPT_LINES) {
+      const toRemove = finals.length - MAX_TRANSCRIPT_LINES;
+      for (let i = 0; i < toRemove; i++) {
+        finals[i].remove();
+      }
+    }
+  }
+
   // ---- Assistant captions (text) ----
   function appendAssistantText(delta){
     if (!delta) return;
@@ -601,7 +614,10 @@ document.addEventListener("DOMContentLoaded", () => {
     line.className = "final assistant";
     line.textContent = frag.textContent.trim();
     frag.remove();
-    if (line.textContent) transcriptEl.appendChild(line);
+    if (line.textContent) {
+      transcriptEl.appendChild(line);
+      pruneOldTranscripts();
+    }
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
@@ -623,7 +639,10 @@ document.addEventListener("DOMContentLoaded", () => {
     line.className = "final user";
     line.textContent = (fullText || (frag ? frag.textContent : "") || "").trim();
     if (frag) frag.remove();
-    if (line.textContent) transcriptEl.appendChild(line);
+    if (line.textContent) {
+      transcriptEl.appendChild(line);
+      pruneOldTranscripts();
+    }
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
@@ -954,7 +973,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Barge-in: user starts talking → cancel assistant
         if (t === "input_audio_buffer.speech_started") {
-          latencyTracker.onUserInterrupt(); // Track barge-in start
+          latencyTracker.onSpeechStart(); // Track when server VAD detects speech
+          latencyTracker.onUserInterrupt(); // Track barge-in start (if assistant is speaking)
           hardStopAssistantAudio("server-vad");
           latencyTracker.onAudioStopped(); // Track audio stop completion
           return;
@@ -1078,7 +1098,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const change = vadTick();
       if (change === "start") {
         hardStopAssistantAudio("local-vad");
-        latencyTracker.onSpeechStart(); // Track speech start for latency measurement
+        // Speech start tracked by server VAD (input_audio_buffer.speech_started)
         const now = performance.now();
         if (now - lastVADEmit > 120) {
           disturbOrb();

@@ -65,7 +65,8 @@ export class LatencyTracker {
 
   /**
    * Mark the start of user speech
-   * Called when VAD detects speech onset (client-side or server-side)
+   * IMPORTANT: Must be called when SERVER VAD detects speech (input_audio_buffer.speech_started)
+   * NOT when local VAD detects speech (to avoid including upload buffering time)
    */
   onSpeechStart() {
     if (!this.enabled) return;
