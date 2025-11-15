@@ -881,7 +881,7 @@ document.addEventListener("DOMContentLoaded", () => {
             type: "server_vad",
             threshold: 0.1,
             prefix_padding_ms: 200, //300
-            silence_duration_ms: 350 //1000
+            silence_duration_ms: 200 //1000 or 350-500
           },
 
           // tone
@@ -1021,7 +1021,7 @@ document.addEventListener("DOMContentLoaded", () => {
     inputNode.connect(captureNode);
 
     const inRate = audioContext.sampleRate;           // ~48000
-    const frameMs = 80;                              // ≥100ms per append //220 before
+    const frameMs = 70;                              // ≥100ms per append //220 before
     const samplesPerFrame = Math.floor(inRate * (frameMs / 1000));
 
     let acc = new Float32Array(0);
@@ -1096,21 +1096,28 @@ document.addEventListener("DOMContentLoaded", () => {
     // Local VAD barge-in / finalize
     if (micActive) {
       const change = vadTick();
+
       if (change === "start") {
+        // User started talking → barge in, stop assistant
         hardStopAssistantAudio("local-vad");
-        // Speech start tracked by server VAD (input_audio_buffer.speech_started)
         const now = performance.now();
         if (now - lastVADEmit > 120) {
           disturbOrb();
           lastVADEmit = now;
         }
         silenceFrames = 0;
+      } else if (change === "end") {
+        // Local VAD thinks user stopped → force flush to server
+        maybeCommitToServer(true);  // 👈 force = true
+        silenceFrames = 0;
       } else if (vadState.speaking) {
+        // Still speaking
         silenceFrames = 0;
       } else {
+        // Optional fallback quiet detection (can be much shorter)
         silenceFrames++;
-        if (silenceFrames > 30) { // ~500ms @60fps
-          maybeCommitToServer();
+        if (silenceFrames > 10) { // ~160ms @60fps (instead of 30)
+          maybeCommitToServer(true);
           silenceFrames = 0;
         }
       }
