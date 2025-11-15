@@ -117,9 +117,9 @@ document.addEventListener("DOMContentLoaded", () => {
     speakHold: 1.0,
     silenceHold: 0,
     attackFrames: 3,
-    releaseFrames: 100, // ~1s at ~60fps
-    thresholdRatio: 8.0,
-    zcrWeight: 0.4
+    releaseFrames: 25, // ~1s at ~60fps //100
+    thresholdRatio: 3.5, //8.0
+    zcrWeight: 0.2 //0.4 reduce ZCR influence
   };
 
   function initAudio() {
@@ -880,8 +880,8 @@ document.addEventListener("DOMContentLoaded", () => {
           turn_detection: {
             type: "server_vad",
             threshold: 0.1,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 1000
+            prefix_padding_ms: 200, //300
+            silence_duration_ms: 350 //1000
           },
 
           // tone
@@ -1021,7 +1021,7 @@ document.addEventListener("DOMContentLoaded", () => {
     inputNode.connect(captureNode);
 
     const inRate = audioContext.sampleRate;           // ~48000
-    const frameMs = 220;                              // ≥100ms per append
+    const frameMs = 80;                              // ≥100ms per append //220 before
     const samplesPerFrame = Math.floor(inRate * (frameMs / 1000));
 
     let acc = new Float32Array(0);
@@ -1065,8 +1065,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const now = performance.now();
     if (!force) {
-      if (appendedMsSinceCommit < 120) return;
-      if (now - lastCommitAt < 300) return;
+      if (appendedMsSinceCommit < 80) return; // was 120
+      if (now - lastCommitAt < 120) return; //was 300
     }
     try {
       ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
