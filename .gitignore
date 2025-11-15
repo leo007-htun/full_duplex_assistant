@@ -3,3 +3,4 @@ src/assistant/.env
 **/__pycache__/
 **/*.pyc
 node_modules
+paper_enhanced.tex

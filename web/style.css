@@ -134,3 +134,19 @@ body{
 
 /* Accessibility helper for screen readers (hidden) */
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+/* Latency download button */
+.download-latency-btn{
+  margin-top:0.8rem; width:100%; padding:0.6rem 0.8rem;
+  background:rgba(39,225,255,.12); border:1px solid rgba(39,225,255,.35);
+  color:var(--acc); font-family:"TheGoodMonolith",monospace; font-size:.72rem;
+  letter-spacing:.08em; cursor:pointer; border-radius:4px;
+  transition:all .2s ease;
+}
+.download-latency-btn:hover{
+  background:rgba(39,225,255,.22); border-color:rgba(39,225,255,.55);
+  box-shadow:0 0 12px rgba(39,225,255,.25);
+}
+.download-latency-btn:active{
+  transform:scale(0.98);
+}

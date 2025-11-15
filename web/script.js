@@ -1,7 +1,29 @@
 import * as THREE from "https://esm.sh/three@0.175.0";
 import { OrbitControls } from "https://esm.sh/three@0.175.0/examples/jsm/controls/OrbitControls.js";
+import { LatencyTracker } from "./latency_tracker.js";
 
 document.addEventListener("DOMContentLoaded", () => {
+  /* ===========================
+     LATENCY TRACKER
+  ============================ */
+  const latencyTracker = new LatencyTracker();
+
+  // Download CSV button
+  const downloadBtn = document.getElementById("download-latency-csv");
+  if (downloadBtn) {
+    downloadBtn.addEventListener("click", () => {
+      const csv = latencyTracker.exportCSV();
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `latency_measurements_${Date.now()}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      notify("LATENCY DATA DOWNLOADED", "ok", 1500);
+    });
+  }
+
   /* ===========================
      PRELOADER
   ============================ */
@@ -855,11 +877,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         if (t === "conversation.item.input_audio_transcription.completed") {
           finalizeTranscript(msg.transcript || "");
+          latencyTracker.onTranscriptComplete(msg.transcript || ""); // Track ASR completion
           return;
         }
 
         // When speech stops, request a response (text + audio)
         if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
+          latencyTracker.onSpeechStopEvent(); // Track VAD speech stop event
           ws.send(JSON.stringify({
             type: "response.create",
             response: {
@@ -887,6 +911,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Assistant text deltas for captions
         if (t === "response.output_text.delta" || t === "response.transcript.delta") {
+          if (!latencyTracker.currentTurn.firstTokenTime) {
+            latencyTracker.onFirstToken(); // Track first LLM token
+          }
           appendAssistantText(msg.delta || msg.text || msg.value || "");
           return;
         }
@@ -898,7 +925,13 @@ document.addEventListener("DOMContentLoaded", () => {
         // Assistant audio deltas (base64 PCM16)
         if (t === "response.output_audio.delta" || t === "response.audio.delta") {
           const b64 = msg.delta || msg.audio;
-          if (b64 && pcmPlayer) pcmPlayer.enqueueBase64PCM16(b64, activeGen);
+          if (b64) {
+            if (!latencyTracker.currentTurn.firstAudioChunkTime) {
+              latencyTracker.onFirstAudioChunk(); // Track first TTS audio chunk
+              latencyTracker.onAudioPlaybackStart(); // Assume playback starts immediately
+            }
+            if (pcmPlayer) pcmPlayer.enqueueBase64PCM16(b64, activeGen);
+          }
           return;
         }
         if (t === "response.output_audio.done") {
@@ -907,7 +940,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Barge-in: user starts talking → cancel assistant
         if (t === "input_audio_buffer.speech_started") {
+          latencyTracker.onUserInterrupt(); // Track barge-in start
           hardStopAssistantAudio("server-vad");
+          latencyTracker.onAudioStopped(); // Track audio stop completion
           return;
         }
 
@@ -1029,6 +1064,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const change = vadTick();
       if (change === "start") {
         hardStopAssistantAudio("local-vad");
+        latencyTracker.onSpeechStart(); // Track speech start for latency measurement
         const now = performance.now();
         if (now - lastVADEmit > 120) {
           disturbOrb();
