@@ -8,17 +8,24 @@
  *    |                                                    |
  *    └─ onSpeechStart() (user speaks)                   |
  *         ↓ (audio upload)                              ↓
- *         ────────────────────────────────────→ VAD Processing
+ *         ────────────────────────────────────→ Server VAD + ASR Processing
  *                                                        ↓
  *    ←── onSpeechStopEvent() ──────────────── speech_stopped event
+ *    ←── onTranscriptComplete() ──────────── (implicit - ASR done in VAD)
  *                                                        ↓
- *    ←── onTranscriptComplete() ──────────── ASR Processing
+ *    ←── onFirstToken() ──────────────────── response.created (LLM starts)
  *                                                        ↓
- *    ←── onFirstToken() ──────────────────── LLM Inference (TTFT)
- *                                                        ↓
- *    ←── onFirstAudioChunk() ─────────────── TTS Synthesis
+ *    ←── onFirstAudioChunk() ─────────────── TTS Synthesis (audio.delta)
  *         ↓
  *    └─ onAudioPlaybackStart() (user hears assistant)
+ *
+ * NOTE: With server_vad, user transcription events are NOT sent by the API.
+ * ASR latency is implicit in the VAD processing. We measure:
+ * - VAD latency: speech_start → speech_stopped
+ * - ASR latency: ~0ms (implicit in speech_stopped event)
+ * - LLM latency: speech_stopped → response.created
+ * - TTS latency: response.created → first audio.delta
+ * - Playback: first audio.delta → browser playback
  *
  * All network latency (browser ↔ OpenAI) is automatically included because
  * we measure wall-clock time (performance.now()) between events.

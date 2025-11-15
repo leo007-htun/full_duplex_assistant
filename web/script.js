@@ -879,23 +879,25 @@ document.addEventListener("DOMContentLoaded", () => {
         try { msg = JSON.parse(ev.data); } catch { return; }
         const t = msg.type;
 
-        // Debug: log ALL event types (including deltas)
-        console.log('[WS Event]', t);
+        // Debug: Uncomment to see all WebSocket events
+        // console.log('[WS Event]', t);
 
-        // Live ASR text
+        // User transcript (if the API sends it)
         if (t === "conversation.item.input_audio_transcription.delta") {
           appendTranscript(msg.delta || "");
           return;
         }
         if (t === "conversation.item.input_audio_transcription.completed") {
           finalizeTranscript(msg.transcript || "");
-          latencyTracker.onTranscriptComplete(msg.transcript || ""); // Track ASR completion
           return;
         }
 
         // When speech stops, request a response (text + audio)
-        if (t === "transcription.speech_stopped" || t === "input_audio_buffer.collected") {
+        if (t === "input_audio_buffer.speech_stopped") {
           latencyTracker.onSpeechStopEvent(); // Track VAD speech stop event
+          // Note: User transcript not available with server_vad
+          // So we mark this as end of ASR processing (implicit in server VAD)
+          latencyTracker.onTranscriptComplete("[user speech]"); // ASR done (implicit)
           ws.send(JSON.stringify({
             type: "response.create",
             response: {
@@ -906,8 +908,9 @@ document.addEventListener("DOMContentLoaded", () => {
           return;
         }
 
-        // New response lifecycle
+        // New response lifecycle - LLM starts processing
         if (t === "response.created") {
+          latencyTracker.onFirstToken(); // Track LLM start (first token equivalent)
           bumpGeneration();           // new gen for this response
           if (pcmPlayer) pcmPlayer.clear(); // clear residual audio
           return;
@@ -922,21 +925,20 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         // Assistant text deltas for captions
-        if (t === "response.output_text.delta" || t === "response.transcript.delta") {
-          if (!latencyTracker.currentTurn.firstTokenTime) {
-            latencyTracker.onFirstToken(); // Track first LLM token
-          }
-          appendAssistantText(msg.delta || msg.text || msg.value || "");
+        if (t === "response.audio_transcript.delta") {
+          // First token already tracked at response.created
+          appendAssistantText(msg.delta || "");
           return;
         }
-        if (t === "response.completed" || t === "response.output_text.done") {
+        if (t === "response.audio_transcript.done") {
+          // This is assistant transcript, not user transcript
           endAssistantCaption();
           return;
         }
 
         // Assistant audio deltas (base64 PCM16)
-        if (t === "response.output_audio.delta" || t === "response.audio.delta") {
-          const b64 = msg.delta || msg.audio;
+        if (t === "response.audio.delta") {
+          const b64 = msg.delta;
           if (b64) {
             if (!latencyTracker.currentTurn.firstAudioChunkTime) {
               latencyTracker.onFirstAudioChunk(); // Track first TTS audio chunk
@@ -946,7 +948,7 @@ document.addEventListener("DOMContentLoaded", () => {
           }
           return;
         }
-        if (t === "response.output_audio.done") {
+        if (t === "response.audio.done") {
           return;
         }
 
