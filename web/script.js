@@ -12,6 +12,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const downloadBtn = document.getElementById("download-latency-csv");
   if (downloadBtn) {
     downloadBtn.addEventListener("click", () => {
+      // Check if there's any data to download
+      const totalMeasurements = Object.values(latencyTracker.measurements)
+        .reduce((sum, arr) => sum + arr.length, 0);
+
+      if (totalMeasurements === 0) {
+        notify("NO DATA YET • HAVE A CONVERSATION FIRST", "warn", 2500);
+        return;
+      }
+
       const csv = latencyTracker.exportCSV();
       const blob = new Blob([csv], { type: "text/csv" });
       const url = URL.createObjectURL(blob);
@@ -20,7 +29,7 @@ document.addEventListener("DOMContentLoaded", () => {
       a.download = `latency_measurements_${Date.now()}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      notify("LATENCY DATA DOWNLOADED", "ok", 1500);
+      notify(`DOWNLOADED ${totalMeasurements} MEASUREMENTS`, "ok", 1500);
     });
   }
 
