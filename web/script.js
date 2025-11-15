@@ -879,6 +879,9 @@ document.addEventListener("DOMContentLoaded", () => {
         try { msg = JSON.parse(ev.data); } catch { return; }
         const t = msg.type;
 
+        // Debug: log ALL event types (including deltas)
+        console.log('[WS Event]', t);
+
         // Live ASR text
         if (t === "conversation.item.input_audio_transcription.delta") {
           appendTranscript(msg.delta || "");
